@@ -1,12 +1,13 @@
 package com.juandgaines.prismgreen
 
-import org.junit.Assert.assertEquals
-import org.junit.Test
+import assertk.assertThat
+import assertk.assertions.isEqualTo
+import org.junit.jupiter.api.Test
 
 class GreetingTest {
 
     @Test
-    fun greetingComposableExists() {
-        assertEquals("Android", "Android")
+    fun theAppKnowsItsName() {
+        assertThat("prismgreen").isEqualTo("prismgreen")
     }
 }

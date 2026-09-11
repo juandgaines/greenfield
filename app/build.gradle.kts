@@ -47,11 +47,21 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
-    testImplementation(libs.junit)
+    // JUnit5 + assertK, which PRISM's JUnit4InJvmUnitTest and NonAssertKAssertion
+    // rules require of every NEW jvm test. The version catalog already carries
+    // them; the module has to declare them.
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.jupiter.engine)
+    testImplementation(libs.assertk.jvm)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     debugImplementation(libs.androidx.compose.ui.tooling)
+}
+
+// JUnit5 needs the platform runner switched on explicitly.
+tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
 }

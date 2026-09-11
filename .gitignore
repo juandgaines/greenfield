@@ -13,3 +13,34 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# --- PRISM ------------------------------------------------------------------
+# Appended by setup. Every line is here because PRISM ADDS something to your
+# repository that git would otherwise offer to commit.
+# Gradle output from the modules PRISM adds. A root-only `/build` does not cover
+# tooling/prism-rules, tooling/konsist or build-logic — measured at 5.9 MB and
+# 672 files staged in one install before anyone noticed.
+**/build/
+.kotlin/
+
+# PRISM ships Python under .prism/ and executes it.
+__pycache__/
+*.pyc
+
+# LIVE GATE VERDICTS, and the one line here that prevents a false pass rather
+# than a large diff. The Stop gate short-circuits on a turn-fingerprint match,
+# so a committed verdict grants a PASS to every machine that pulls it — for a
+# tree that machine never built.
+.prism/verify/state/
+
+# The self-extracting installer, if you dropped it in the repository root. Its
+# contents are already unpacked into .prism/, tooling/ and build-logic/.
+/prism-verify
+/prism-verify-*.zip
+
+# NOT IGNORED, DELIBERATELY: every module's detekt.baseline.xml and
+# ktlint.baseline.xml.
+# They are the observe-posture record — the findings this repository has agreed
+# to defer — and they must be COMMITTED. Ignore them and every teammate is met
+# with findings the team already decided not to block on. Generated, and still
+# yours to keep.

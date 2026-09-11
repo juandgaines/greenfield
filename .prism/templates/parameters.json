@@ -1,0 +1,140 @@
+{
+  "$comment": [
+    "The enumerable parameter set. Setup is an agent following SETUP.md, and",
+    "that instruction can only be written against a closed set — so every",
+    "parameter a template uses is declared here, and `render.py --check`",
+    "fails when one is not.",
+    "",
+    "Tiers, per design decision D12 of openspec change",
+    "prism-parameterise-and-relocate. The split is who OWNS the value:",
+    "",
+    "  literal    the framework owns it. Baked into the payload, not a",
+    "             parameter at all. Listed here only where a reader would",
+    "             otherwise expect to find one.",
+    "  defaulted  the consumer owns it, but an honest default exists, so it",
+    "             renders unattended and is overridden only if they care.",
+    "  required   the consumer owns it and NO honest default exists. It must",
+    "             be discovered against the target repository.",
+    "",
+    "A required parameter may not ship a default. That rule is load-bearing:",
+    "the tempting default is a name borrowed from whichever repository the",
+    "value was first written against. It renders cleanly, installs without",
+    "complaint, and points the analysis at a tree the consumer does not have.",
+    "It would fail by succeeding."
+  ],
+  "parameters": {
+    "PACKAGE_ROOT": {
+      "tier": "required",
+      "description": "The consumer's root Kotlin package — the namespace konsist analyses. No default is possible: guessing it yields an empty analysis scope, in which every architecture rule passes over nothing.",
+      "templates": [
+        "core/tooling/konsist/src/test/kotlin/com/plcoding/prism/tooling/konsist/ProjectScope.kt.in"
+      ]
+    },
+    "MODULE_PACKAGE_ROOTS": {
+      "tier": "required",
+      "description": "The consumer's module-path to package-root map, derived from their settings.gradle.kts. Rendered as Kotlin map entries, indented eight spaces, one per line. Only the consumer's own modules: PRISM's two tooling modules are literals in the template, since their packages ship with the framework.",
+      "templates": [
+        "core/tooling/konsist/src/test/kotlin/com/plcoding/prism/tooling/konsist/ModulePackageRoots.kt.in"
+      ]
+    },
+    "LAYER_PURITY_DOMAIN_PACKAGE": {
+      "tier": "required",
+      "description": "The package prefix the layer-purity rule treats as domain-owned: the CONCEPTUALLY SHARED core domain, not one feature's. The rule asserts that nothing under it imports io.ktor.* or kotlinx.serialization.*, so pointing it at a feature checks that feature and silently leaves the shared model unchecked. DERIVE IT, DO NOT ASK. Collect every package prefix ending in '.domain' and prefer the one whose parent segment is core, common or shared:\n  git grep -h '^package ' -- '*.kt' | sed 's/^package //; s/[[:space:]]*$//' \\\n    | grep -o '^.*\\.domain' | sort | uniq -c | sort -rn\nPick the single candidate matching '\\.(core|common|shared)\\.domain$'. FILE COUNT IS NOT THE TIE-BREAK and must not be used as one: on a measured repository the shared core domain and a feature's domain both held 20 files, so counting picks a coin flip while the segment name picks correctly. Ask the human only when the probe returns NO candidate with a shared segment and more than one '.domain' prefix exists -- that is a layering this rule has no opinion about. Getting it wrong is recoverable in a way the theme names are not: the rule uses assertAllWhereApplicable, so a prefix matching nothing is reported as SKIPPED with its reason rather than passing green. That asymmetry is why this parameter is derived and PALETTE_OBJECT is not.",
+      "templates": [
+        "core/tooling/konsist/src/test/kotlin/com/plcoding/prism/tooling/konsist/LayerPurityRulesTest.kt.in"
+      ]
+    },
+    "PALETTE_OBJECT": {
+      "tier": "required",
+      "description": "The declaration holding the consumer's raw colour palette — what ThemeColorDirectUse forbids reading directly, and whose entries UnwiredThemeColor checks are reachable through the theme. It may be an object, a class or a data class; do not probe for the literal word 'object'. No default is possible: a wrong name matches nothing, and both rules then report success over the code they were pointed at. It is the same failure as a wrong PACKAGE_ROOT, arriving through a detekt rule instead of a konsist scope. GUARDED BY PALETTE_RULES_ACTIVE: when that switch is false this takes the inert value 'none', and when it is true 'none' is REFUSED at render time. A repository whose colours are top-level vals has no palette declaration to name -- that is the case PALETTE_RULES_ACTIVE=false exists for.",
+      "templates": [
+        "core/templates/detekt.yml.in"
+      ]
+    },
+    "EXTENDED_TOKEN_HOLDER": {
+      "tier": "required",
+      "description": "The class holding the consumer's extended colour tokens. UnwiredThemeColor counts a palette entry as wired when a colour scheme references it OR when it is a default on this class, so a wrong name turns every extended token into a false 'unwired' finding. GUARDED BY PALETTE_RULES_ACTIVE, on the same terms as PALETTE_OBJECT.",
+      "templates": [
+        "core/templates/detekt.yml.in"
+      ]
+    },
+    "THEME_OBJECT": {
+      "tier": "required",
+      "description": "The consumer's theme composable — the one PreviewMustWrapInTheme requires every preview to wrap its content in. No default is possible: a wrong name matches no call, so every preview in the repository is reported, each message naming a composable the consumer has never heard of. That failure is loud rather than silent, but a rule that flags every preview gets switched off and takes the rules beside it. GUARDED BY THEME_RULES_ACTIVE: false pairs with 'none', true refuses it.",
+      "templates": [
+        "core/templates/detekt.yml.in"
+      ]
+    },
+    "THEME_RULES_ACTIVE": {
+      "tier": "defaulted",
+      "default": "true",
+      "description": "Whether the three theme rules run: PreviewMustWrapInTheme, RawColorLiteral and NoCustomCompositionLocal. THE CONDITION, STATED ONCE AND NOWHERE ELSE: set it false only when the repository has no theme composable AND no theme package. The two PALETTE rules used to sit in this group and no longer do -- see PALETTE_RULES_ACTIVE, and the reason the group was split. RawColorLiteral and NoCustomCompositionLocal belong here because both exempt the theme package -- the sanctioned definition site -- so where there is none, every colour token and every CompositionLocal the theme is built from is reported as a violation of a theme that does not exist. DO NOT PROBE FOR THE LITERAL WORD 'object'. Search for a composable that wraps MaterialTheme, and for a theme package. If one is found but THEME_OBJECT cannot be identified, ASK THE HUMAN: do not answer false and do not guess. Set it false in a repository that genuinely has NO theme -- a bare library, a pure-JVM module -- where THEME_OBJECT has no answer and inventing one is worse than not running the rules; THEME_OBJECT then takes the inert value 'none'. style.MagicNumber deliberately stays outside this group: it is a general rule, and a glob that matches nothing excludes nothing.",
+      "templates": [
+        "core/templates/detekt.yml.in"
+      ],
+      "guards": [
+        "THEME_OBJECT"
+      ]
+    },
+    "PALETTE_RULES_ACTIVE": {
+      "tier": "defaulted",
+      "default": "true",
+      "description": "Whether the two palette rules run: ThemeColorDirectUse and UnwiredThemeColor. THE CONDITION, STATED ONCE AND NOWHERE ELSE: set it false only when NO DECLARATION HOLDS THE RAW COLOURS -- when the palette is a set of top-level vals rather than an object, class or data class. That is a real and common shape, and it is why this switch exists separately from THEME_RULES_ACTIVE. A measured install had a theme composable, an extended-token holder and a theme package but no palette declaration; with one all-or-nothing switch the installer had no honest answer, and wrote paletteObject: 'none' with the rules left ON. Both rules then matched nothing and reported success over five files that violated them. Splitting the group is what makes 'three of five rules apply here' expressible. WHEN FALSE, PALETTE_OBJECT and EXTENDED_TOKEN_HOLDER take the inert value 'none'; when true, 'none' is REFUSED at render time and by the rules themselves. Note what this switch does NOT do: turning it off does not make raw-colour use legal, it means no rule in the set can express it -- say so in the install record rather than letting the gap disappear.",
+      "guards": [
+        "PALETTE_OBJECT",
+        "EXTENDED_TOKEN_HOLDER"
+      ],
+      "templates": [
+        "core/templates/detekt.yml.in"
+      ]
+    },
+    "HARNESS": {
+      "tier": "defaulted",
+      "default": "none",
+      "description": "Which agent harness runs the gates day to day: claude-code, cursor, codex, copilot, antigravity, or none. Defaulted to 'none' because an install with no adapter is a SUPPORTED outcome, not a failure -- the pre-push floor is unconditional and the gates stay runnable by hand. Read by prism-doctor to decide which registration to verify; an unrecognised value fails rather than being ignored, because a typo here would otherwise mean the doctor checks no harness at all and says nothing.",
+      "templates": [
+        "core/templates/prism.json.in"
+      ]
+    },
+    "POSTURE": {
+      "tier": "defaulted",
+      "default": "enforce",
+      "description": "Which install this repository chose: 'enforce' (every gate blocks, the pre-push floor installed) or 'observe' (findings that existed at install recorded in detekt.baseline.xml, the floor optionally declined). The rendered value is PROVISIONAL: SETUP.md step 8b measures the repository and rewrites this key with what it resolved, so the default only decides what sits here for the few steps in between. Note that 'enforce' is installed by the ABSENCE of .prism/scope.json, never by this string -- writing 'enforce' here over a tree that still has a scope file full of 'observe' is exactly the disagreement the doctor now fails on. NO GATE READS THIS KEY and the test suite asserts that none does -- it is a record of a decision, not a switch, which is the whole reason it is permitted where a runtime escape hatch is not. prism-doctor reads it to decide whether a missing pre-push hook is a chosen state or a gap, and `./prism promote --all` is what flips it. Editing it by hand changes nothing except what the doctor reports, which is itself the point: the doctor then tells you the record and the reality disagree.",
+      "templates": [
+        "core/templates/prism.json.in"
+      ]
+    },
+    "BASE_BRANCH": {
+      "tier": "defaulted",
+      "default": "main",
+      "description": "The branch every gate computes its change scope against. Defaulted rather than required because it is derivable at install from the repository's own origin HEAD, and 'main' is honest when it is not.",
+      "templates": [
+        "core/templates/prism.json.in"
+      ]
+    },
+    "COVERAGE_DEFAULT_THRESHOLD": {
+      "tier": "defaulted",
+      "default": 80,
+      "description": "Minimum coverage percentage across a module. PRISM's own policy from Principle IV, so a real default rather than a guess about the consumer. Declared, not yet consumed: the live value is still verify/thresholds.json, and moving it is Phase 2's. Per design D6 exactly one knob travels the whole route in Phase 1, so a key here that nothing reads would be a value a consumer could set and watch do nothing.",
+      "templates": []
+    },
+    "COVERAGE_CRITICAL_THRESHOLD": {
+      "tier": "defaulted",
+      "default": 100,
+      "description": "Minimum coverage percentage for security-critical algorithmic code. PRISM's policy, per Principle IV. Declared, not yet consumed — see COVERAGE_DEFAULT_THRESHOLD.",
+      "templates": []
+    },
+    "EMULATOR_MIN_SDK": {
+      "tier": "defaulted",
+      "default": 26,
+      "description": "The API level the device hint suggests when instrumentation coverage needs an emulator. A shipped default the consumer overrides to their own minSdk. Declared, not yet consumed: the hint is a literal 26 in status.sh and push-gate.sh until Phase 2.",
+      "templates": []
+    },
+    "COVERAGE_ASSETS_DIR": {
+      "tier": "defaulted",
+      "default": ".prism/assets",
+      "description": "Where the coverage init scripts, the device lock and the report renderer live. Defaulted to the framework's own directory so an install with no harness directory needs no value — two of five supported harnesses receive none. Read by the engine as PRISM_ASSETS_DIR, resolved in lib/affected.sh; the prism.json key that overrides it is Phase 2's, per design D6.",
+      "templates": []
+    }
+  }
+}

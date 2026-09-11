@@ -1,0 +1,196 @@
+# Schema declaration, not configuration.
+#
+# detekt's `config.validation` checks every entry in the root `detekt.yml`
+# against the defaults it can see, and it can only see a rule set's names if the
+# rule set ships them. Without this file the whole `prism` section of the root
+# config would be rejected as misspelled.
+#
+# Whether a rule is on, and what it excludes, is decided in the root `detekt.yml`
+# and nowhere else. Everything here stays off so that this file can never quietly
+# become a second place rules are configured from.
+prism:
+  NonAtomicStateFlowAssignment:
+    active: false
+  SingleLetterIdentifier:
+    active: false
+  NoConsoleLogging:
+    active: false
+  # Both names below belong to the CONSUMER's design system, so they ship empty
+  # rather than carrying a plausible-looking default. A wrong palette name makes
+  # either rule match nothing and report success over the code it was pointed at,
+  # so they refuse to run unconfigured instead of running and finding nothing.
+  ThemeColorDirectUse:
+    active: false
+    paletteObject: ''
+  UnwiredThemeColor:
+    active: false
+    paletteObject: ''
+    extendedTokenHolder: ''
+  IconContentDescription:
+    active: false
+  IconButtonHardcodedSize:
+    active: false
+  NoOpenClassInMain:
+    active: false
+  TextFieldStateInViewModel:
+    active: false
+  ObserveAsEventsRequired:
+    active: false
+  NoPublicMutableFlow:
+    active: false
+  NoRunBlockingInMain:
+    active: false
+  NoNotNullAssertion:
+    active: false
+  HardcodedUserFacingString:
+    active: false
+  RawColorLiteral:
+    active: false
+  NoBareIconClickable:
+    active: false
+  NoComposableModifierExtension:
+    active: false
+  CallbackFlowRequiresAwaitClose:
+    active: false
+  KtorCallMustUseSafeCall:
+    active: false
+  SuspendGenericCatchSwallowsCancellation:
+    active: false
+  SealedHierarchyOfOnlyObjectsShouldBeEnum:
+    active: false
+    exemptSuffixes: ['Action', 'Event']
+  NoImplSuffix:
+    active: false
+  NoResultListOfErrors:
+    active: false
+    collectionTypeNames: ['List', 'MutableList', 'Set', 'MutableSet', 'Collection', 'Map', 'MutableMap']
+  EmptyResultOverResultUnit:
+    active: false
+  StateInViewModelRequiresWhileSubscribed:
+    active: false
+    viewModelScopeNames: ['viewModelScope']
+  SharedFlowRequiresExplicitBuffer:
+    active: false
+  OneShotFlowBuilder:
+    active: false
+  CustomScopeRequiresSupervisorJob:
+    active: false
+  CollectAsStateWithoutLifecycle:
+    active: false
+  WorkerResultTypealiasRequired:
+    active: false
+  UniqueWorkNameIsSnakeCase:
+    active: false
+    uniqueWorkFunctions:
+      - 'enqueueUniqueWork'
+      - 'enqueueUniquePeriodicWork'
+      - 'beginUniqueWork'
+  StartForegroundViaServiceCompat:
+    active: false
+  DispatchersSetMainWithoutReset:
+    active: false
+  InMemoryRoomNotClosed:
+    active: false
+  RouteMustBeSerializable:
+    active: false
+  RouteMustBeDataObjectOrDataClass:
+    active: false
+  NavGraphBuilderExtensionNaming:
+    active: false
+  NoCrossFeatureRouteImport:
+    active: false
+  AdaptiveLayoutOwnsNoState:
+    active: false
+    allowedStateFactories:
+      - 'rememberScrollState'
+      - 'rememberLazyListState'
+      - 'rememberLazyGridState'
+      - 'rememberLazyStaggeredGridState'
+      - 'rememberPagerState'
+      - 'rememberTextFieldState'
+      - 'rememberUpdatedState'
+  KoinModuleNaming:
+    active: false
+  PreferConstructorReferenceKoinDefinition:
+    active: false
+  StartKoinOnlyInAppModule:
+    active: false
+  HttpClientMustAcceptEngine:
+    active: false
+  HttpClientConstructionOutsideFactory:
+    active: false
+  NoSharedPreferencesForTokens:
+    active: false
+  JUnit4InJvmUnitTest:
+    active: false
+  JUnit5InInstrumentedTest:
+    active: false
+  NonAssertKAssertion:
+    active: false
+    allowedJupiterAssertions: ['assertThrows', 'assertDoesNotThrow']
+  MockingLibraryInTest:
+    active: false
+    mockingLibraryPrefixes: ['io.mockk', 'org.mockito', 'org.easymock']
+  RobolectricInTest:
+    active: false
+  JvmComposeTestRule:
+    active: false
+  ThreadSleepOrEspressoIdleInTest:
+    active: false
+  ReflectionInTest:
+    active: false
+  RoomInJvmUnitTest:
+    active: false
+  ModifierParameterDefaultIsModifier:
+    active: false
+  ModifierParameterAfterRequiredParameters:
+    active: false
+  ComposableSlotParameterAfterModifier:
+    active: false
+  NoPreviewParameterAnnotation:
+    active: false
+  PreviewMustBePrivate:
+    active: false
+  PreviewFunctionNaming:
+    active: false
+  PreviewMustWrapInTheme:
+    active: false
+    themeName: ''
+  NoCustomCompositionLocal:
+    active: false
+  StableAnnotationOnUnstableState:
+    active: false
+    stableCollectionTypes:
+      - 'ImmutableList'
+      - 'ImmutableSet'
+      - 'ImmutableMap'
+      - 'PersistentList'
+      - 'PersistentSet'
+      - 'PersistentMap'
+  ScreenStateOnlyInScreenComposable:
+    active: false
+    allowedStateTypes:
+      - 'LazyListState'
+      - 'LazyGridState'
+      - 'LazyStaggeredGridState'
+      - 'ScrollState'
+      - 'TextFieldState'
+      - 'PagerState'
+      - 'SheetState'
+      - 'SnackbarHostState'
+      - 'DrawerState'
+      - 'TooltipState'
+      - 'PullToRefreshState'
+      - 'TopAppBarState'
+  RootAndScreenInSameFile:
+    active: false
+  KoinViewModelOnlyInRoot:
+    active: false
+  ObserveAsEventsOnlyInRoot:
+    active: false
+  RootComposableMustDefaultViewModel:
+    active: false
+  EventChannelExposedAsReceiveAsFlow:
+    active: false
+  ScreenComposableParameterOrder:
+    active: false

@@ -1,0 +1,36 @@
+{
+  "$comment": [
+    "Which engines BLOCK, per module. Read live on every run; nothing is",
+    "regenerated from it. Edit it directly.",
+    "",
+    "ITS ABSENCE IS NOT NEUTRAL. With no scope file every engine enforces in",
+    "every module, so DELETING this file is how you finish adopting, not how",
+    "you opt out. The push guard refuses to let it reappear.",
+    "",
+    "  observe   the engine runs, writes its reports, and does not fail the",
+    "            build. The rules are NOT off and the findings are NOT hidden.",
+    "  enforce   findings fail the build.",
+    "",
+    "A module entry is a PARTIAL override: engines it does not name fall back",
+    "to `default`. Promotion is therefore one line, which is deliberate -- a",
+    "promotion somebody has to write four times is one they batch up and stop",
+    "doing.",
+    "",
+    "THE DIRECTION MATTERS. Promoting (observe -> enforce) is always allowed.",
+    "Demoting is refused by the push gate when the base branch says otherwise,",
+    "because a push may not both need a weakening and contain it. To demote,",
+    "make it its own commit and merge it first, where a human sees a one-line",
+    "diff whose entire purpose is visible.",
+    "",
+    "`observe` is a stage, not a destination. `./prism status` reports how long",
+    "each one has been there, which is the only thing that stops it becoming",
+    "permanent by inattention."
+  ],
+  "default": {
+    "detekt": "observe",
+    "ktlint": "observe",
+    "konsist": "observe",
+    "coverage": "observe"
+  },
+  "modules": {}
+}

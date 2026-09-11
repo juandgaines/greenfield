@@ -1,0 +1,1413 @@
+#!/bin/sh
+# prism-doctor — PRISM is a verification framework. This decides whether a
+#                repository can host it, and whether an install actually
+#                worked. It PERFORMS nothing.
+#
+#   prism-doctor --preflight    before a single file is written.
+#                               "Can this repo host PRISM at all?"
+#   prism-doctor                after wiring. "Did the install work?"
+#
+# It is the whole safety argument for an agentic install. An agent that just
+# spent fifteen minutes wiring a repository is the least reliable judge of
+# whether it wired it correctly, so the verdict is not its to give. The agent
+# performs and then reads what this names; this decides.
+#
+# THE FAILURE IT EXISTS FOR is a false green. Copying the rules module into a
+# repo does nothing on its own: the module must be included, put on the
+# `detektPlugins` configuration, given its config sections, and applied per
+# module. Miss the second and detekt runs, loads zero rules, and reports
+# BUILD SUCCESSFUL over unexamined code. Nothing about that looks wrong. Check
+# D2 greps for it and check D5 proves the opposite by making a real rule fire.
+#
+# Scoped deliberately: the checks below are the ones whose failure is SILENT,
+# plus the cheap greps that name a missing piece precisely. Anything that fails
+# loudly on the consumer's next command is not this script's job.
+#
+# Inherits the engine's rule that an inability to ask the question is not an
+# answer of "no": every check reports PASS, FAIL, or UNDETERMINED, and
+# UNDETERMINED exits non-zero. See lib/config.sh for where that rule comes from.
+
+set -u
+
+HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PRISM_ROOT="${PRISM_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+
+if [ -z "$PRISM_ROOT" ] || [ ! -d "$PRISM_ROOT" ]; then
+    printf 'prism-doctor: not a git repository, and PRISM_ROOT is unset.\n' >&2
+    exit 2
+fi
+
+MODE="postflight"
+SELECTED_HARNESS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --preflight) MODE="preflight"; shift ;;
+        --detect) MODE="detect"; shift ;;
+        --harness)
+            if [ $# -lt 2 ]; then
+                printf 'prism-doctor: --harness needs a name.\n' >&2
+                exit 2
+            fi
+            SELECTED_HARNESS="$2"; shift 2 ;;
+        --help|-h)
+            sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        "") shift ;;
+        *)
+            printf 'prism-doctor: unknown argument "%s". Use --preflight, --detect, --harness <name>, or no argument.\n' "$1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+RULES_PROJECT=":tooling:prism-rules"
+KONSIST_PROJECT=":tooling:konsist"
+CANARY_RULE="NoConsoleLogging"
+CANARY_CLASS="PrismDoctorCanary"
+
+pass_count=0
+fail_count=0
+undetermined_count=0
+
+# Symmetric with the two below, and it was not always. A PASS used to be a
+# headline and nothing else, which was fine while every passing check was
+# simply "this is wired". A posture makes some passes conditional -- "no floor,
+# because you declined it" -- and those have to be able to say what to do next
+# without the sentence becoming a paragraph. Extra arguments were silently
+# DISCARDED before, so a caller that supplied them got a report missing exactly
+# the line that mattered.
+report_pass() {
+    printf '  PASS  %s\n' "$1"
+    shift
+    for line in "$@"; do printf '        %s\n' "$line"; done
+    pass_count=$((pass_count + 1))
+}
+report_fail() {
+    printf '  FAIL  %s\n' "$1"
+    shift
+    for line in "$@"; do printf '        %s\n' "$line"; done
+    fail_count=$((fail_count + 1))
+}
+# A failing preflight prints its reasons as it goes, and until 0.6.2 that was
+# all it printed: the installer closed with "preflight did not pass, so nothing
+# was written" and left the human to scroll back through PASS lines looking for
+# the two FAILs. A check that knows exactly which file to edit should say so
+# once more, together, at the end. Each preflight failure registers one line
+# here: WHERE to make the change, and WHAT the change is.
+remedies=""
+remedy() {
+    remedies="${remedies}${1}	${2}
+"
+}
+
+report_undetermined() {
+    printf '  ????  %s\n' "$1"
+    shift
+    for line in "$@"; do printf '        %s\n' "$line"; done
+    undetermined_count=$((undetermined_count + 1))
+}
+
+# ---------------------------------------------------------------------------
+# Version discovery
+#
+# A catalog is the likely home but never the only one, and its `version.ref`
+# indirection means a grep for a literal version string finds nothing in a
+# well-formed catalog. python3 is already a hard prerequisite of the engine;
+# tomllib is not (it is 3.11+, and 3.9 is still common), so this is a small
+# hand-rolled reader in the same style as lib/coverage.py.
+# ---------------------------------------------------------------------------
+# The detekt version this payload is PINNED to, read from the shipped catalog
+# fragment rather than written out here. The pin is the whole reason detekt is
+# the one exception to "a version they already pin is theirs": the 72 rules
+# compile against that exact detekt-api, in a 2.0 alpha series where the API
+# churns every 7-8 weeks.
+shipped_detekt_pin() {
+    for candidate in "$PRISM_ROOT/.prism/templates/libs.versions.toml.fragment" \
+        "$HOOK_DIR/../templates/libs.versions.toml.fragment"; do
+        if [ -f "$candidate" ]; then
+            sed -n 's/^detekt[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$candidate" | head -1
+            return 0
+        fi
+    done
+    printf ''
+}
+
+# Any dev.detekt coordinate in the consumer's catalog, however they declared it.
+#
+# catalog_version() matches a [plugins] id or an alias spelled dev-detekt, which
+# misses the most ordinary way a catalog carries detekt: a [libraries] entry
+# with group = "dev.detekt" and a version.ref, and no plugin alias at all --
+# exactly how PRISM itself declares it. A repository on a DIFFERENT 2.0 alpha
+# was reported as "no conflicting detekt install" because of that gap.
+catalog_detekt_version() {
+    python3 - "$PRISM_ROOT" <<'PY_DETEKT' 2>/dev/null
+import os, re, sys
+
+path = os.path.join(sys.argv[1], "gradle", "libs.versions.toml")
+if not os.path.isfile(path):
+    sys.exit(1)
+
+section, versions, refs, literals = None, {}, set(), []
+with open(path, encoding="utf-8") as fh:
+    for raw in fh:
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        if not line or line.startswith("#"):
+            continue
+        if section == "versions":
+            m = re.match(r'([A-Za-z0-9_.-]+)\s*=\s*"([^"]+)"', line)
+            if m:
+                versions[m.group(1)] = m.group(2)
+        elif section in ("libraries", "plugins"):
+            # group = "dev.detekt", module = "dev.detekt:...", id = "dev.detekt"
+            if not re.search(r'"dev\.detekt(?:[:"]|\b)', line):
+                continue
+            ref = re.search(r'version\.ref\s*=\s*"([^"]+)"', line)
+            lit = re.search(r'version\s*=\s*"([^"]+)"', line)
+            if ref:
+                refs.add(ref.group(1))
+            elif lit:
+                literals.append(lit.group(1))
+
+for name in sorted(refs):
+    if name in versions:
+        print(versions[name])
+        sys.exit(0)
+for value in literals:
+    print(value)
+    sys.exit(0)
+sys.exit(1)
+PY_DETEKT
+}
+
+catalog_version() {
+    # catalog_version <alias-or-plugin-id>
+    python3 - "$PRISM_ROOT" "$1" <<'PY' 2>/dev/null
+import os, re, sys
+root, wanted = sys.argv[1], sys.argv[2].replace("_", "-").replace(".", "-")
+path = os.path.join(root, "gradle", "libs.versions.toml")
+if not os.path.isfile(path):
+    sys.exit(1)
+section, versions, hits = None, {}, []
+with open(path, encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        if not line or line.startswith("#"):
+            continue
+        if section == "versions":
+            m = re.match(r'([A-Za-z0-9_.-]+)\s*=\s*"([^"]+)"', line)
+            if m:
+                versions[m.group(1).replace("_", "-").replace(".", "-")] = m.group(2)
+        elif section in ("plugins", "libraries"):
+            key = re.match(r'([A-Za-z0-9_.-]+)\s*=', line)
+            ident = re.search(r'(?:id|module)\s*=\s*"([^"]+)"', line)
+            lit = re.search(r'version\s*=\s*"([^"]+)"', line)
+            ref = re.search(r'version\.ref\s*=\s*"([^"]+)"', line)
+            names = set()
+            if key:
+                names.add(key.group(1).replace("_", "-").replace(".", "-"))
+            if ident:
+                names.add(ident.group(1).replace("_", "-").replace(".", "-"))
+            if wanted in names:
+                if lit:
+                    hits.append(lit.group(1))
+                elif ref:
+                    hits.append(versions.get(ref.group(1).replace("_", "-").replace(".", "-"), ""))
+# a bare [versions] alias is the common case and is checked last so an explicit
+# plugin/library entry wins
+if wanted in versions:
+    hits.append(versions[wanted])
+for h in hits:
+    if h:
+        print(h)
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+inline_version() {
+    # inline_version <extended-regex with one capture group>
+    find "$PRISM_ROOT" -name '*.gradle.kts' -o -name '*.gradle' 2>/dev/null \
+        | grep -v '/build/' \
+        | head -50 \
+        | xargs grep -hoE "$1" 2>/dev/null \
+        | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9.]+)?' \
+        | head -1
+}
+
+version_at_least() {
+    # version_at_least <found> <minimum>. Compares the numeric head only:
+    # 2.4.10-Beta1 vs 2.4 answers the question the floor actually asks.
+    python3 - "$1" "$2" <<'PY' 2>/dev/null
+import re, sys
+def head(v):
+    m = re.match(r'(\d+(?:\.\d+)*)', v.strip())
+    return [int(p) for p in m.group(1).split(".")] if m else []
+a, b = head(sys.argv[1]), head(sys.argv[2])
+if not a:
+    sys.exit(2)
+a += [0] * (len(b) - len(a))
+b += [0] * (len(a) - len(b))
+sys.exit(0 if a >= b else 1)
+PY
+}
+
+# ---------------------------------------------------------------------------
+# PREFLIGHT — refuse in seconds rather than after fifteen minutes of wiring.
+# File reads only. No Gradle invocation.
+# ---------------------------------------------------------------------------
+# P5 — harness readiness. The toolchain is not the only thing that can make an
+# install enforce nothing.
+#
+# A harness can be installed, configured correctly, and gate nothing, and every
+# observed cause fails SILENTLY: not signed in, hooks not trusted, plugin not
+# loaded, repo-local file ignored. Checking the repository's Kotlin version and
+# stopping there answers the easy half of "can this repo host PRISM".
+#
+# What this can honestly establish before anything is written is whether the
+# CLI exists and what that harness's delivery is known to do. Authentication and
+# trust grants live outside the repository and outside this process; they are
+# NAMED as steps the human owns rather than reported as checked.
+harness_readiness() {
+    name="$1"
+    manifest=$(harness_manifest) || {
+        report_undetermined "cannot check harness readiness" \
+            "No adapters/harnesses.json beside this script."
+        return
+    }
+    tier=$(harness_field "$manifest" "$name" tier)
+    if [ -z "$tier" ]; then
+        report_fail "'$name' is not a supported harness" \
+            "Supported: claude-code, cursor, codex, copilot, antigravity."
+        return
+    fi
+
+    case "$name" in
+        claude-code) cli="claude" ;;
+        cursor)      cli="cursor-agent" ;;
+        codex)       cli="codex" ;;
+        copilot)     cli="copilot" ;;
+        antigravity) cli="agy" ;;
+        *)           cli="" ;;
+    esac
+
+    if [ -n "$cli" ] && ! command -v "$cli" >/dev/null 2>&1; then
+        # Not fatal: setup may be run from one harness for another, and the
+        # gates do not depend on which agent installed them.
+        report_undetermined "$name: '$cli' is not on PATH here" \
+            "Not fatal — the gates do not care which agent installed them." \
+            "But nothing will fire until that harness runs in this repository."
+    elif [ -n "$cli" ]; then
+        report_pass "$name: '$cli' is on PATH"
+    fi
+
+    if [ "$tier" = "2" ]; then
+        # PASS, not UNDETERMINED. This check used to end its own text with
+        # "This is a supported install, not a failure" and then grade itself
+        # ????, which forced the whole run to UNDETERMINED -- and SETUP.md step
+        # 1 tells the installing agent that anything but exit 0 means stop. So
+        # preflight refused to install on the two harnesses that are tier 2 BY
+        # DESIGN, on a configuration this framework supports and documents.
+        #
+        # Same rule D6 already follows for a declined pre-push floor: a chosen,
+        # recorded state reports as chosen. A doctor that fails a supported
+        # configuration is a doctor people learn to ignore.
+        reason=$(harness_field "$manifest" "$name" inert_reason)
+        report_pass "$name is tier 2 — its in-turn gate will NOT be active" \
+            "$reason" \
+            "The registration is still installed, inert, and .git/hooks/pre-push" \
+            "is the enforcement. This is a supported install, not a failure."
+    fi
+
+    if [ "$(harness_field "$manifest" "$name" requires_trust)" = "true" ]; then
+        # PASS here, UNDETERMINED after the install. The grant happens AFTER
+        # setup -- this check's own text says so -- so it is not a reason to
+        # refuse installing, and refusing was what it did: preflight exited 2
+        # and SETUP.md step 1 tells the agent that anything but 0 means stop.
+        # The question "do the gates actually fire?" is real, unanswerable from
+        # here, and belongs to the postflight run, which is where it now is.
+        report_pass "$name registers hooks that are inert until the project is trusted" \
+            "Not a blocker for installing. Registration is not enforcement:" \
+            "grant the trust after setup, then re-run prism-doctor, which" \
+            "reports this as UNDETERMINED until you confirm the gates fire."
+    fi
+}
+
+# The build a consumer actually has. Written by setup from the archive's own
+# VERSION file; absent on an install predating it, or on a payload copied by
+# hand, and saying "unstamped" is more useful than saying nothing.
+prism_build_stamp() {
+    for candidate in "$PRISM_ROOT/.prism/VERSION" "$HOOK_DIR/../VERSION" "$HOOK_DIR/../../VERSION"; do
+        if [ -f "$candidate" ]; then
+            tr -d ' \n' < "$candidate"
+            return 0
+        fi
+    done
+    printf 'unstamped'
+}
+
+# Which agents does this machine actually have?
+#
+# harness_readiness() answers "is the harness you NAMED ready". This answers the
+# question that comes before it, and the install had no way to ask it: a human
+# was expected to know which of five rows was theirs. Reading PATH is not proof
+# a harness will run PRISM's hooks -- nothing here is -- but it turns a choice
+# from a table into a choice from what is installed.
+detect() {
+    printf 'prism-doctor --detect  [%s]\n\n' "$(prism_build_stamp)"
+    manifest=$(harness_manifest) || {
+        printf 'no adapters/harnesses.json beside this script.\n' >&2
+        return 2
+    }
+    python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))["harnesses"]
+for name, row in rows.items():
+    print("\t".join([name, row["cli"], str(row["tier"])]))
+' "$manifest" | while IFS="$(printf '\t')" read -r name cli tier; do
+        if command -v "$cli" >/dev/null 2>&1; then
+            printf '  FOUND      %-13s (%s)  tier %s\n' "$name" "$cli" "$tier"
+        else
+            printf '  not found  %-13s (%s)\n' "$name" "$cli"
+        fi
+    done
+    printf '\nFOUND means the CLI is on PATH — not that its hooks will fire.\n'
+    printf 'Tier 2 harnesses do not run in-turn gates at all; pre-push is theirs.\n'
+    return 0
+}
+
+preflight() {
+    printf 'prism-doctor --preflight  %s  [%s]\n\n' "$PRISM_ROOT" "$(prism_build_stamp)"
+
+    # P0 — python3, FIRST, because the engine is unusable without it and every
+    # later check here would fail in its own idiom instead of naming the cause.
+    # Nothing else in this function can run either: every gate parses JSON with
+    # `python3 -c`, and render.py, scope.py, baseline.py, coverage.py, guard.py
+    # and place.py are the install.
+    #
+    # PRESENT IS NOT THE SAME AS RUNNABLE. `command -v` finds a name on PATH,
+    # including a dangling symlink from a removed Homebrew python or a shim that
+    # exits non-zero, so the check RUNS it. This is also the one prerequisite
+    # `./prism-verify` cannot report on its own behalf: it is a zipapp with a
+    # `#!/usr/bin/env python3` shebang, so a machine without python3 gets
+    # `env: python3: No such file or directory` from the kernel and nothing from
+    # us. That is why README.md names the .zip as the way in for those machines.
+    if ! command -v python3 >/dev/null 2>&1; then
+        remedy "python3" "install it, or use a machine that has it"
+        report_fail "python3 is not on PATH" \
+            "Every gate parses its configuration with python3, and the installer" \
+            "renders every template with it. Nothing in PRISM runs without it." \
+            "Install python3, or use a machine that has it."
+    elif ! py_version=$(python3 -c 'import platform; print(platform.python_version())' 2>/dev/null); then
+        remedy "python3" "the name on PATH does not execute -- reinstall it"
+        report_fail "python3 is on PATH but does not run" \
+            "$(command -v python3) exists and exits non-zero on a trivial program." \
+            "A dangling symlink from a removed interpreter looks exactly like this." \
+            "Check it by hand:  python3 -c 'print(1)'"
+    else
+        report_pass "python3 $py_version runs"
+    fi
+
+    # P1 — a Gradle project at all.
+    if [ -f "$PRISM_ROOT/settings.gradle.kts" ]; then
+        report_pass "settings.gradle.kts present"
+    else
+        remedy "settings.gradle.kts" "PRISM needs a Gradle project with a Kotlin-DSL settings file"
+        report_fail "no settings.gradle.kts" \
+            "PRISM assumes Gradle with a Kotlin-DSL settings file." \
+            "A settings.gradle (Groovy) project is not supported."
+    fi
+
+    if [ -f "$PRISM_ROOT/gradlew" ]; then
+        report_pass "gradle wrapper present"
+    else
+        remedy "./gradlew" "run: gradle wrapper"
+        report_fail "no ./gradlew" \
+            "Every gate shells out to the wrapper. Run 'gradle wrapper' first."
+    fi
+
+    # P2 — detekt COORDINATES, not version. This is the likeliest real-world
+    # collision and it is a migration, not an install: 1.x and 2.x are
+    # different group ids with different config, so there is nothing to merge.
+    if grep -rqs 'io\.gitlab\.arturbosch\.detekt' \
+        "$PRISM_ROOT/gradle" "$PRISM_ROOT"/*.gradle.kts "$PRISM_ROOT"/*/*.gradle.kts 2>/dev/null; then
+        remedy "gradle/libs.versions.toml" "move off detekt 1.x (io.gitlab.arturbosch.detekt) first -- that is a migration, not an install"
+        report_fail "this repository is on detekt 1.x" \
+            "Found the io.gitlab.arturbosch.detekt coordinates." \
+            "PRISM's rules are compiled against dev.detekt 2.0.0-alpha.6." \
+            "The group id changed and the whole configuration moves with it," \
+            "so this is a MIGRATION, not an install. PRISM will not merge into it."
+    else
+        existing=$(catalog_detekt_version || true)
+        [ -n "${existing:-}" ] || existing=$(catalog_version "dev-detekt" || true)
+        pin=$(shipped_detekt_pin)
+        if [ -z "${existing:-}" ]; then
+            report_pass "no existing detekt — PRISM will add ${pin:-its pinned version}"
+        elif [ -n "$pin" ] && [ "$existing" = "$pin" ]; then
+            report_pass "existing detekt $existing matches PRISM's pin"
+        elif ! version_at_least "$existing" "2.0.0"; then
+            remedy "gradle/libs.versions.toml" "detekt = \"${pin}\"   (it reads $existing)"
+            report_fail "detekt $existing is below 2.0" \
+                "PRISM's rules import dev.detekt.api types that 2.0 introduced."
+        elif [ -n "$pin" ]; then
+            # Same coordinates, same major -- and still not interchangeable. The
+            # rule set compiles against one detekt-api, and 2.0 is the alpha
+            # series where that API moves. Accepting "close enough" here is how
+            # a consumer gets a rules module that will not compile, with an
+            # error naming detekt's jars rather than the version they chose.
+            remedy "gradle/libs.versions.toml" "detekt = \"${pin}\"   (it reads $existing)"
+            report_fail "this repository pins detekt $existing; PRISM pins $pin" \
+                "PRISM's 72 rules are compiled against $pin's detekt-api, and the" \
+                "2.0 alpha series changes that API roughly every 7-8 weeks." \
+                "detekt is the ONE version PRISM overrides rather than keeping." \
+                "Set detekt = \"$pin\" in gradle/libs.versions.toml, or install" \
+                "a PRISM build pinned to $existing."
+        else
+            report_pass "existing detekt $existing is on dev.detekt 2.x"
+        fi
+    fi
+
+    # P3 — Kotlin 2.4, required by detekt 2.0. The floor that excludes more
+    # candidate repositories than anything else in the product.
+    kotlin=$(catalog_version "kotlin" || true)
+    [ -z "${kotlin:-}" ] && kotlin=$(catalog_version "org-jetbrains-kotlin-android" || true)
+    [ -z "${kotlin:-}" ] && kotlin=$(catalog_version "org-jetbrains-kotlin-jvm" || true)
+    [ -z "${kotlin:-}" ] && kotlin=$(inline_version 'org\.jetbrains\.kotlin\.[a-z]+"\)?[[:space:]]+version[[:space:]]+"[^"]+' || true)
+    [ -z "${kotlin:-}" ] && kotlin=$(inline_version 'kotlin\("(jvm|android|multiplatform)"\)[[:space:]]+version[[:space:]]+"[^"]+' || true)
+
+    if [ -z "${kotlin:-}" ]; then
+        remedy "gradle/libs.versions.toml" "state the Kotlin version under [versions] so it can be read"
+        report_undetermined "could not determine the Kotlin version" \
+            "Looked in gradle/libs.versions.toml ([versions] and [plugins])" \
+            "and inline 'version \"...\"' declarations in *.gradle.kts." \
+            "PRISM requires Kotlin 2.4 or later; state it and re-run."
+    elif version_at_least "$kotlin" "2.4"; then
+        report_pass "Kotlin $kotlin"
+    else
+        remedy "gradle/libs.versions.toml" "kotlin = \"2.4.x\"   (it reads $kotlin)"
+        report_fail "Kotlin $kotlin is below 2.4" \
+            "detekt 2.0 requires Kotlin 2.4, and PRISM's 72 rules compile against it." \
+            "This is a change to YOUR build, not something setup can do for you."
+    fi
+
+    # P5 — the harness, when one was named. Optional because setup asks which
+    # agent AFTER preflight: refusing early on a toolchain floor costs ten
+    # seconds and needs no answer from the human.
+    [ -n "$SELECTED_HARNESS" ] && harness_readiness "$SELECTED_HARNESS"
+
+    # The whole point of the register: one block naming the files and the edits,
+    # so the answer to "what do I need to do?" does not have to be reconstructed
+    # from a transcript.
+    if [ -n "$remedies" ]; then
+        count=$(printf '%s' "$remedies" | grep -c .)
+        printf '\n'
+        if [ "$count" -eq 1 ]; then
+            printf 'This repository cannot host PRISM yet. One thing to change:\n\n'
+        else
+            printf 'This repository cannot host PRISM yet. %d things to change:\n\n' "$count"
+        fi
+        printf '%s' "$remedies" | while IFS="$(printf '\t')" read -r where what; do
+            [ -n "$where" ] || continue
+            printf '  %-26s %s\n' "$where" "$what"
+        done
+        printf '\nNothing was written. Run the installer again when they are done.\n'
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# POSTFLIGHT
+# ---------------------------------------------------------------------------
+
+# D5 — the canary. The only check here that cannot pass by accident.
+#
+# Every other check reads a file and believes it. This one makes a real rule
+# fire and looks for the finding, which is the only way to distinguish "detekt
+# is configured" from "detekt is actually loading PRISM's rules". A built-in
+# detekt rule would fire even with the rule set entirely absent, so the rule
+# has to be one of ours: NoConsoleLogging is pure PSI (no type resolution, so
+# it runs in the plain `detekt` task), needs no configuration, and needs no
+# project context — it works on a repo where the theme parameters were never
+# resolved.
+# src/main/kotlin OR src/main/java. Not a nicety: the Android Gradle plugin
+# adds src/main/java to the Kotlin source set, and Android Studio's own
+# templates have put Kotlin there for years, so a large share of real Android
+# repositories keep every .kt file under src/main/java and have no
+# src/main/kotlin at all. Checking only the first name makes the canary --
+# the ONE check here that cannot pass by accident -- unable to run on exactly
+# those repositories, and it reports that as a FAIL the installer cannot fix.
+kotlin_source_root() {
+    for candidate in "$1/src/main/kotlin" "$1/src/main/java"; do
+        if [ -d "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+canary() {
+    module=""
+    module_path=""
+    source_root=""
+    for gradle_path in $(prism_all_modules 2>/dev/null); do
+        dir=$(prism_module_dir "$gradle_path")
+        prism_module_has_detekt "$gradle_path" || continue
+        source_root=$(kotlin_source_root "$PRISM_ROOT/$dir") || continue
+        module="$dir"
+        module_path="$gradle_path"
+        break
+    done
+
+    if [ -z "$module" ]; then
+        report_fail "no module both applies prism.detekt and has Kotlin sources" \
+            "Looked for src/main/kotlin and src/main/java under every module" \
+            "that applies prism.detekt, and found neither." \
+            "Nothing can be proven about the rule set until one does." \
+            "This is the same gap as D4, seen from the other side."
+        return
+    fi
+
+    pkgdir=$(cd "$source_root" && find . -type d -not -path '*/.*' \
+        | sed 's|^\./||' | grep -v '^\.$' | sort | head -1)
+    [ -z "$pkgdir" ] && pkgdir="."
+    pkg=$(printf '%s' "$pkgdir" | tr '/' '.')
+
+    canary_file="$source_root/$pkgdir/$CANARY_CLASS.kt"
+    report_file=$(mktemp -t prism-doctor-report 2>/dev/null) || {
+        report_undetermined "could not create a temporary report path"
+        return
+    }
+    rm -f "$report_file"
+
+    if [ -e "$canary_file" ]; then
+        report_undetermined "refusing to overwrite $CANARY_CLASS.kt" \
+            "$canary_file already exists. Remove it and re-run."
+        return
+    fi
+
+    # Installed BEFORE the file is written. A doctor that leaves a println
+    # behind in a consumer's source tree has broken the repository it was
+    # asked to inspect.
+    trap 'rm -f "$canary_file" "$report_file"' EXIT INT TERM HUP
+
+    if [ "$pkg" = "." ]; then
+        printf 'internal fun prismDoctorCanary() {\n    println("prism-doctor canary")\n}\n' \
+            >"$canary_file"
+    else
+        printf 'package %s\n\ninternal fun prismDoctorCanary() {\n    println("prism-doctor canary")\n}\n' \
+            "$pkg" >"$canary_file"
+    fi
+
+    init_script="$PRISM_ASSETS_DIR/prism-doctor-canary.init.gradle"
+    if [ ! -f "$init_script" ]; then
+        report_undetermined "canary init script missing" "expected at $init_script"
+        rm -f "$canary_file"
+        trap - EXIT INT TERM HUP
+        return
+    fi
+
+    gradle_log=$(mktemp -t prism-doctor-gradle)
+    # The exit status is deliberately ignored: with ignoreFailures set in the
+    # init script a non-zero status means Gradle itself broke, and that case is
+    # caught below by the report being absent or unreadable.
+    ( cd "$PRISM_ROOT" && ./gradlew -q \
+        -Dprism.doctor.report="$report_file" \
+        --init-script "$init_script" \
+        "$module_path:detekt" >"$gradle_log" 2>&1 ) || true
+
+    # Parsing lives in lib/canary_report.py, under test in
+    # tests/test_canary_report.py. It is the framework's only proof that its
+    # own rules are loaded, and an inline heredoc could not be tested at all.
+    verdict=$(python3 "$PRISM_LIB_DIR/canary_report.py" \
+        "$report_file" "$CANARY_CLASS.kt" "$CANARY_RULE" 2>/dev/null)
+
+    rm -f "$canary_file" "$report_file"
+    trap - EXIT INT TERM HUP
+
+    case "$verdict" in
+        found)
+            report_pass "a $CANARY_RULE violation was REPORTED — the rule set is live"
+            ;;
+        file-analysed)
+            report_fail "detekt analysed the canary and did NOT report $CANARY_RULE" \
+                "This is the false green the whole framework exists to prevent:" \
+                "detekt is running and the PRISM rules are not loaded." \
+                "Check, in order:" \
+                "  1. settings.gradle.kts includes $RULES_PROJECT" \
+                "  2. the project is on the detektPlugins configuration" \
+                "  3. detekt.yml carries the prism: sections" \
+                "  4. this module applies id(\"prism.detekt\")"
+            ;;
+        not-analysed)
+            report_fail "detekt produced a report but never analysed the canary" \
+                "Written to ${source_root#"$PRISM_ROOT/"}/$pkgdir/, which the task did not read." \
+                "Check detekt's source set configuration for this module."
+            ;;
+        no-report|unreadable)
+            report_undetermined "detekt produced no report" \
+                "Gradle output:" \
+                "$(tail -5 "$gradle_log" 2>/dev/null | tr '\n' ' ')" \
+                "Cannot conclude the rules are loaded, and will not assume they are."
+            ;;
+        *)
+            report_undetermined "the report could not be parsed" "$verdict"
+            ;;
+    esac
+    rm -f "$gradle_log"
+}
+
+# ---------------------------------------------------------------------------
+# D8 — THE HARNESS. Registration is not enforcement.
+#
+# Four distinct ways a harness can be installed, configured correctly, and
+# enforce nothing were observed while probing, and in EVERY case the failure
+# mode is silence rather than an error: not signed in (Cursor), hooks not
+# trusted (Codex), plugin not loaded (Antigravity), repo-local file ignored
+# (Copilot). An install that checks only "did I write the config file?" reports
+# success in all four.
+#
+# So this checks three separate things, and they fail independently:
+#
+#   1. the registration exists and names a command that is actually there
+#   2. that command, when run, DENIES -- proving the whole chain from the
+#      string in the config file through the dispatcher to a gate is live
+#   3. the harness's own delivery caveat: fail-closed set where the harness
+#      defaults to fail-open, trust required, or tier 2 reported NOT ACTIVE
+#
+# What it deliberately does NOT claim: that the harness itself invokes the
+# command. Only the harness can demonstrate that, and asserting it from here
+# would be the green-over-nothing this file exists to prevent.
+# ---------------------------------------------------------------------------
+harness_manifest() {
+    for candidate in "$PRISM_ROOT/.prism/adapters/harnesses.json" \
+        "$HOOK_DIR/../adapters/harnesses.json"; do
+        if [ -f "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+harness_field() {
+    python3 -c '
+import json, sys
+try:
+    rows = json.load(open(sys.argv[1]))["harnesses"]
+    row = rows.get(sys.argv[2]) or {}
+except Exception:
+    sys.exit(1)
+value = row.get(sys.argv[3])
+if value is None:
+    print("")
+elif isinstance(value, bool):
+    print("true" if value else "false")
+elif isinstance(value, list):
+    print(" ".join(str(v) for v in value))
+else:
+    print(value)
+' "$1" "$2" "$3" 2>/dev/null
+}
+
+# The posture RECORD. Read with inline python rather than prism_config_get,
+# and that is not a style choice: config.sh is the gates' reader, and
+# tests/test_base_branch.sh asserts how many production sites call it. A
+# posture on that path would be a runtime switch, which R7 forbids. This is a
+# record of an install-time decision that only the doctor and `prism-verify
+# enforce` read, so it stays off the gates' reader entirely.
+#
+# Echoes: enforce | observe | invalid:<value> | absent
+prism_posture() {
+    cfg="$PRISM_ROOT/.prism/prism.json"
+    [ -f "$cfg" ] || { printf 'absent\n'; return; }
+    value=$(python3 -c "
+import json,sys
+try: print(json.load(open(sys.argv[1])).get('posture','') or '')
+except Exception: print('')" "$cfg" 2>/dev/null)
+    case "$value" in
+        # `mixed` since 0.6.1: step 8b decides per engine, so the normal result
+        # of a derived install is some engines blocking and some not. A scalar
+        # could not describe that, and a doctor that refused to read it would
+        # fail every correctly-installed repository.
+        enforce|observe|mixed) printf '%s\n' "$value" ;;
+        "") printf 'absent\n' ;;
+        *) printf 'invalid:%s\n' "$value" ;;
+    esac
+}
+
+# How much a posture CLAIMS to block, as a number, so the two can be compared
+# rather than enumerated pair by pair. enforce > mixed > observe.
+prism_posture_strength() {
+    case "$1" in
+        enforce) printf '3\n' ;;
+        mixed)   printf '2\n' ;;
+        observe) printf '1\n' ;;
+        *)       printf '0\n' ;;
+    esac
+}
+
+# What actually blocks, read from the file the ENGINES read. The posture key is
+# a record and nothing enforces it; .prism/scope.json is the decision, and its
+# ABSENCE is the strict reading -- no file means every engine enforces in every
+# module. Resolves to one of: enforce | observe | mixed | unreadable.
+#
+# This exists because 0.5.0 shipped a doctor that printed
+# "posture: enforce -- every gate blocks" from the key alone, over trees where
+# all four engines were observing. A verdict that never opened the deciding
+# file is not a verdict.
+prism_scope_reality() {
+    scope="$PRISM_ROOT/.prism/scope.json"
+    [ -f "$scope" ] || { printf 'enforce\n'; return; }
+    command -v python3 >/dev/null 2>&1 || { printf 'unreadable\n'; return; }
+    python3 -c "
+import json, sys
+E = ('detekt', 'ktlint', 'konsist', 'coverage')
+try:
+    raw = json.load(open(sys.argv[1]))
+except Exception:
+    print('unreadable'); raise SystemExit
+if not isinstance(raw, dict):
+    print('unreadable'); raise SystemExit
+d = dict.fromkeys(E, 'enforce')
+d.update({k: v for k, v in (raw.get('default') or {}).items() if k in E})
+seen = set(d[e] for e in E)
+for entry in (raw.get('modules') or {}).values():
+    if isinstance(entry, dict):
+        for e in E:
+            seen.add(entry.get(e, d[e]))
+if seen == {'enforce'}:
+    print('enforce')
+elif seen == {'observe'}:
+    print('observe')
+else:
+    print('mixed')
+" "$scope" 2>/dev/null || printf 'unreadable\n'
+}
+
+check_harness() {
+    cfg="$PRISM_ROOT/.prism/prism.json"
+    selected=$(python3 -c "
+import json,sys
+try: print(json.load(open(sys.argv[1])).get('harness','') or '')
+except Exception: print('')" "$cfg" 2>/dev/null)
+
+    if [ -z "$selected" ] || [ "$selected" = "none" ]; then
+        # A supported outcome, not a failure. The floor is installed and the
+        # gates are runnable by hand; nothing fires during a turn, and the
+        # report says exactly that rather than implying a gap.
+        report_pass "no harness adapter selected — the pre-push floor is the gate"
+        return
+    fi
+
+    manifest=$(harness_manifest) || {
+        report_undetermined "no adapters/harnesses.json" \
+            "Cannot tell what '$selected' is supposed to have installed."
+        return
+    }
+
+    tier=$(harness_field "$manifest" "$selected" tier)
+    if [ -z "$tier" ]; then
+        report_fail "'$selected' is not a supported harness" \
+            "Supported: claude-code, cursor, codex, copilot, antigravity." \
+            "Set 'harness' in .prism/prism.json to one of those, or to 'none'."
+        return
+    fi
+
+    registration=$(harness_field "$manifest" "$selected" registration)
+    gate_active=$(harness_field "$manifest" "$selected" gate_active)
+    fail_closed_key=$(harness_field "$manifest" "$selected" fail_closed_key)
+    reg_path="$PRISM_ROOT/$registration"
+
+    # 1 — the registration is present and parses.
+    if [ ! -f "$reg_path" ]; then
+        report_fail "$selected: no $registration" \
+            "The adapter was selected but its hook registration never landed." \
+            "Re-run setup, or set harness to 'none' if that was deliberate."
+        return
+    fi
+    if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$reg_path" 2>/dev/null; then
+        report_fail "$selected: $registration is not valid JSON" \
+            "The harness will ignore it silently."
+        return
+    fi
+
+    # 2 — it names the dispatcher, and the dispatcher is there.
+    if ! grep -q 'prism-hook' "$reg_path" 2>/dev/null; then
+        report_fail "$selected: $registration does not call prism-hook" \
+            "Whatever it registers, it is not PRISM's gates."
+        return
+    fi
+    dispatcher="$PRISM_ROOT/.prism/adapters/lib/prism-hook"
+    if [ ! -f "$dispatcher" ]; then
+        report_fail "$selected: $registration points at a dispatcher that is not installed" \
+            "Expected .prism/adapters/lib/prism-hook" \
+            "The hooks are registered and every one of them will fail to run."
+        return
+    fi
+
+    # 3 — fail-closed, where the harness defaults to allowing on hook failure.
+    # Measured on Cursor: an identical crashing hook allows the command without
+    # failClosed and blocks it with the key set. One word between a gate and
+    # the appearance of one.
+    if [ -n "$fail_closed_key" ]; then
+        hooks_total=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1])).get("hooks", {})
+n = 0
+for entries in d.values():
+    n += len(entries) if isinstance(entries, list) else 0
+print(n)' "$reg_path" 2>/dev/null)
+        hooks_closed=$(python3 -c '
+import json, sys
+key = sys.argv[2]
+d = json.load(open(sys.argv[1])).get("hooks", {})
+n = 0
+for entries in d.values():
+    if isinstance(entries, list):
+        n += sum(1 for e in entries if isinstance(e, dict) and e.get(key) is True)
+print(n)' "$reg_path" "$fail_closed_key" 2>/dev/null)
+        if [ "${hooks_closed:-0}" != "${hooks_total:-1}" ]; then
+            report_fail "$selected: $hooks_closed of $hooks_total hooks set $fail_closed_key" \
+                "This harness ALLOWS the action when a hook fails or times out." \
+                "Every gate hook must set \"$fail_closed_key\": true, or the gate" \
+                "is bypassed by any crash — silently, and looking green."
+            return
+        fi
+    fi
+
+    # 4 — the chain is live. Feed the dispatcher an event it must refuse and
+    # require a denial. This is the harness-layer equivalent of the canary: it
+    # proves the command in the registration is reachable, executable, and
+    # denies, rather than that a file exists with the right text in it.
+    # Deliberately NOT valid JSON. An unparseable payload is the case where the
+    # dispatcher must refuse, and refusing is the property worth proving: it is
+    # the difference between a gate and a gate-shaped thing.
+    #
+    # A denial reaches the harness by one of two routes, and which one depends
+    # on the harness: three read the process exit status, two read a JSON
+    # document on stdout and ignore the status. So accept either, with
+    # `deny_shape` naming the key to read for the document harnesses. Demanding
+    # rc=2 alone would require a document harness to answer in a vocabulary it
+    # does not speak.
+    deny_shape=$(harness_field "$manifest" "$selected" deny_shape)
+    probe_out=$(printf 'prism-doctor: not a hook event' \
+        | sh "$dispatcher" --harness "$selected" --gate push 2>/dev/null)
+    probe_rc=$?
+    denied=no
+    [ "$probe_rc" -eq 2 ] && denied=yes
+    if [ "$denied" = "no" ] && [ -n "$deny_shape" ]; then
+        verdict=$(printf '%s' "$probe_out" | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    print("unreadable"); raise SystemExit(0)
+print(doc.get(sys.argv[1]) or "absent")' "$deny_shape" 2>/dev/null)
+        [ "$verdict" = "deny" ] && denied=yes
+    fi
+
+    if [ "$denied" = "no" ]; then
+        report_fail "$selected: the registered command did not deny an unreadable event" \
+            "It must exit 2, or say so in the document $selected reads. It did" \
+            "neither, which means a hook that fires would allow whatever it was" \
+            "asked about." \
+            "Run it by hand to see why:" \
+            "  echo '{}' | sh .prism/adapters/lib/prism-hook --harness $selected --gate push"
+        return
+    fi
+
+    # 5 — and it ALLOWS when it must, in the shape THIS harness reads.
+    #
+    # Probing only the deny path is exactly what let a Cursor install ship in
+    # which every allow was an empty stdout: a well-formed refusal, and a hook
+    # FAILURE on every other command. Cursor's adapter correctly sets
+    # `failClosed: true`, and a failed hook there BLOCKS. A gate that denies
+    # correctly and cannot say yes is not a gate, it is a wall.
+    #
+    # The payload carries nothing the ktlint gate looks at, so normalise.py
+    # returns `no-event` and the dispatcher short-circuits before running a
+    # gate: no Gradle, no JVM, no side effects. That is also the most frequent
+    # allow in a real session, and the one that printed nothing.
+    allow_shape=$(harness_field "$manifest" "$selected" allow_shape)
+    if [ -n "$allow_shape" ]; then
+        allow_out=$(printf '{}' \
+            | sh "$dispatcher" --harness "$selected" --gate ktlint 2>/dev/null)
+        if [ -z "$allow_out" ]; then
+            report_fail "$selected: the gate chain's ALLOW prints nothing" \
+                "$selected decides from a JSON document on stdout, so an empty" \
+                "allow is a FAILED hook rather than a permission. With the" \
+                "fail-closed key set that blocks every action the gate was" \
+                "perfectly happy with." \
+                "  printf '{}' | sh .prism/adapters/lib/prism-hook --harness $selected --gate ktlint"
+            return
+        fi
+        if ! printf '%s' "$allow_out" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+            report_fail "$selected: the gate chain's ALLOW is not valid JSON" \
+                "$selected cannot read it, so it counts as a failed hook." \
+                "Got: $allow_out"
+            return
+        fi
+    fi
+
+    if [ "$gate_active" = "true" ]; then
+        report_pass "$selected: hooks registered; the chain denies when it must and allows in $selected's own vocabulary"
+    else
+        # Tier 2. The chain works; the harness will not call it.
+        report_pass "$selected: tier 2 — in-turn gate NOT ACTIVE, pre-push is the enforcement"
+    fi
+
+    # The trust grant, asked where it can be acted on.
+    #
+    # Everything above proves the chain is REACHABLE and correct. On a harness
+    # whose repo-local registration is inert until the project layer is trusted,
+    # none of that means the harness will call it -- and nothing here can see
+    # whether the grant happened. This used to be asked at preflight, where it
+    # refused the install and could not be acted on, and was absent from the run
+    # that happens after setup, which is the only moment the answer exists.
+    if [ "$(harness_field "$manifest" "$selected" requires_trust)" = "true" ]; then
+        report_undetermined "$selected: hooks are registered, but the trust grant cannot be observed" \
+            "$selected treats a project-local registration as inert until the" \
+            "project layer is trusted. Everything above proves the chain works;" \
+            "none of it proves $selected will call it." \
+            "Grant the trust, then confirm a gate actually fires before you" \
+            "rely on this install."
+    fi
+}
+
+postflight() {
+    printf 'prism-doctor  %s  [%s]\n\n' "$PRISM_ROOT" "$(prism_build_stamp)"
+
+    settings="$PRISM_ROOT/settings.gradle.kts"
+
+    # D1 — the module is declared.
+    if grep -q "include(\"$RULES_PROJECT\")" "$settings" 2>/dev/null; then
+        report_pass "settings.gradle.kts includes $RULES_PROJECT"
+    else
+        report_fail "$RULES_PROJECT is not included" \
+            "Add: include(\"$RULES_PROJECT\")" \
+            "The path is fixed — DetektConventionPlugin resolves the rule set by it." \
+            "Installing the module elsewhere compiles, runs, and loads zero rules."
+    fi
+
+    # D2 — THE SILENT ONE. Placing the module is not wiring it.
+    if grep -rqs 'detektPlugins' "$PRISM_ROOT/build-logic" "$PRISM_ROOT/buildSrc" 2>/dev/null \
+        || grep -rqs 'detektPlugins' "$PRISM_ROOT"/*.gradle.kts 2>/dev/null; then
+        report_pass "the rule set is on the detektPlugins configuration"
+    else
+        report_fail "nothing puts the rule set on detektPlugins" \
+            "THIS IS THE SILENT FAILURE. detekt will run, load no rules," \
+            "and report success over code it never checked." \
+            "Add to your detekt convention plugin:" \
+            "  dependencies.add(\"detektPlugins\", dependencies.project(\"$RULES_PROJECT\"))"
+    fi
+
+    # D3 — the config half of the same pair. With config.validation on, a
+    # prism: block naming rules that are NOT loaded is a hard error, so this
+    # check and D2 fail in opposite directions and cover each other.
+    if [ -f "$PRISM_ROOT/detekt.yml" ]; then
+        if grep -q '^prism:' "$PRISM_ROOT/detekt.yml" 2>/dev/null; then
+            report_pass "detekt.yml carries the prism: rule set sections"
+        else
+            report_fail "detekt.yml has no prism: section" \
+                "The rules load but every one of them uses its bundled default," \
+                "and in config.yml every rule ships active: false. Silent green."
+        fi
+    else
+        report_fail "no detekt.yml at the repository root"
+    fi
+
+    # D4 — reach. A rule set loaded but applied nowhere gates nothing.
+    #
+    # PRISM's own two modules are excluded from the count, and this is a
+    # decision rather than an oversight. They are the framework's source, not
+    # the consumer's: gating them reports findings in code the consumer did not
+    # write and cannot sensibly fix -- measured at 101 on a real install -- and
+    # a first day that opens with a hundred findings in a directory the mentee
+    # has never opened is how a framework gets deleted. They are already the
+    # two paths ModulePackageRoots treats as framework literals for the same
+    # reason. Their build files ship without id("prism.detekt"), so counting
+    # them here made a CORRECT install fail this check every time.
+    if [ -f "$PRISM_ROOT/.prism/verify/lib/affected.sh" ] || [ -f "$HOOK_DIR/lib/affected.sh" ]; then
+        total=0
+        wired=0
+        for gradle_path in $(prism_all_modules 2>/dev/null); do
+            case "$gradle_path" in
+                "$RULES_PROJECT"|"$KONSIST_PROJECT") continue ;;
+            esac
+            total=$((total + 1))
+            prism_module_has_detekt "$gradle_path" && wired=$((wired + 1))
+        done
+        if [ "$total" -eq 0 ]; then
+            report_undetermined "no modules found in settings.gradle.kts"
+        elif [ "$wired" -eq "$total" ]; then
+            report_pass "all $total modules apply prism.detekt"
+        else
+            report_fail "$wired of $total modules apply prism.detekt" \
+                "The unwired modules are not gated at all." \
+                "Run 'sh .prism/verify/scope.sh' to list them."
+        fi
+    else
+        report_undetermined "engine not found; cannot enumerate modules"
+    fi
+
+    # D5 — the canary.
+    canary
+
+    # D9 — the catalog. The most likely under-ship, and the one whose failure
+    # reads like a broken product rather than a missing step.
+    #
+    # Measured on a fixture whose catalog lacked the 15 entries the payload
+    # needs: the build fails at build-logic script compilation with
+    # "Unresolved reference 'ktlint'" and "Unresolved reference 'detekt'".
+    # Loud, but it names PRISM's own build file rather than the step that was
+    # skipped, and a consumer reading it concludes the payload is broken. This
+    # turns that into a sentence naming the aliases and the file to merge.
+    #
+    # It reads the shipped fragment rather than a list written out here, so an
+    # alias added to the payload is checked without anyone remembering to.
+    fragment=""
+    for candidate in "$PRISM_ROOT/.prism/templates/libs.versions.toml.fragment" \
+        "$HOOK_DIR/../templates/libs.versions.toml.fragment"; do
+        [ -f "$candidate" ] && fragment="$candidate" && break
+    done
+    catalog="$PRISM_ROOT/gradle/libs.versions.toml"
+    if [ -z "$fragment" ]; then
+        report_undetermined "no libs.versions.toml.fragment to check the catalog against" \
+            "Expected .prism/templates/. Cannot tell whether the catalog merge landed."
+    elif [ ! -f "$catalog" ]; then
+        report_undetermined "no gradle/libs.versions.toml" \
+            "PRISM resolves every tool version from the version catalog."
+    else
+        missing=$(python3 - "$fragment" "$catalog" <<'PY_CATALOG'
+import re, sys
+
+
+def accessor(alias):
+    """Gradle's own alias -> accessor mapping: split on - _ . and camel-case.
+
+    COMPARE ON THIS, NOT ON THE LITERAL ALIAS. `android-gradle-plugin` and the
+    `android-gradlePlugin` a consumer may already declare are different strings
+    and the SAME accessor, so a literal comparison reports ours as missing and
+    the merge it recommends makes the repository unbuildable -- Gradle refuses to
+    generate accessors for a catalog with a name clash, and no project in the
+    build configures. Measured on a 26-module install.
+    """
+    parts = re.split(r"[-_.]", alias)
+    return parts[0] + "".join(w[:1].upper() + w[1:] for w in parts[1:])
+
+
+def aliases(path):
+    found, section = {}, None
+    for line in open(path):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped
+        elif section and "=" in stripped and not stripped.startswith("#"):
+            found.setdefault(section, {})[
+                accessor(stripped.split("=", 1)[0].strip())
+            ] = stripped.split("=", 1)[0].strip()
+    return found
+
+
+want, have = aliases(sys.argv[1]), aliases(sys.argv[2])
+gone = []
+for section, names in want.items():
+    theirs = have.get(section, {})
+    for key in sorted(names):
+        if key not in theirs:
+            gone.append("%s %s" % (section.strip("[]"), names[key]))
+print(", ".join(gone))
+PY_CATALOG
+) || missing="ERROR"
+        if [ "$missing" = "ERROR" ]; then
+            report_undetermined "could not compare the catalog against the fragment"
+        elif [ -n "$missing" ]; then
+            report_fail "gradle/libs.versions.toml is missing entries the payload needs" \
+                "$missing" \
+                "Merge core/templates/libs.versions.toml.fragment into it, adding" \
+                "only absent aliases. Without them the build fails at build-logic" \
+                "script compilation with 'Unresolved reference' — which reads like" \
+                "a broken payload rather than a merge that was skipped."
+        else
+            report_pass "the version catalog carries every alias the payload references"
+        fi
+    fi
+
+    # D8 — the harness. Placed before the floor deliberately: if the in-turn
+    # gate is not active, the floor is not a fallback but the whole enforcement,
+    # and the reader should learn that in this order.
+    check_harness
+
+    # D6 — the enforcement floor. The only gate no harness timeout can bypass.
+    # Asked of git, not assembled from "$PRISM_ROOT/.git/hooks". A linked
+    # worktree's .git is a FILE, and core.hooksPath can move the directory
+    # anywhere -- in both cases the hand-built path names a file that does not
+    # exist while the floor is installed and working. install.sh already
+    # resolves it this way, and a doctor that disagrees with the installer
+    # about where the hook lives reports a missing floor that is right there.
+    hooks_dir=$(git -C "$PRISM_ROOT" rev-parse --git-path hooks 2>/dev/null) || hooks_dir=""
+    case "$hooks_dir" in
+        "") hooks_dir="$PRISM_ROOT/.git/hooks" ;;
+        /*) ;;
+        *) hooks_dir="$PRISM_ROOT/$hooks_dir" ;;
+    esac
+    hook="$hooks_dir/pre-push"
+    posture=$(prism_posture)
+    if [ -f "$hook" ] && [ -x "$hook" ]; then
+        if grep -q 'PRISM_ADAPTER_MARKER' "$hook" 2>/dev/null; then
+            if [ "$posture" = "observe" ]; then
+                # Drift, but in the OVER-blocking direction, which is the one
+                # this framework tolerates everywhere else. Reported so the
+                # record can be corrected, never failed.
+                report_pass "the pre-push floor is installed — but posture is 'observe'" \
+                    "This repository blocks more than its record claims." \
+                    "Promote it and the record follows: ./prism promote --all"
+            else
+                report_pass "the pre-push floor is installed"
+            fi
+        else
+            report_fail "a pre-push hook exists but is not PRISM's" \
+                "PRISM will not overwrite it. Compose the two by hand:" \
+                "  sh .prism/adapters/git/install.sh"
+        fi
+    elif [ -f "$hook" ]; then
+        # Broken in the ALLOWING direction under either posture: git skips a
+        # non-executable hook without reporting anything, so this looks
+        # installed and enforces nothing.
+        report_fail "pre-push exists but is not executable" "chmod +x $hook"
+    elif [ "$posture" = "observe" ]; then
+        # A chosen state, not a gap. The precedent is check_harness's
+        # 'harness: none' branch: a doctor that FAILS on a supported
+        # configuration is a doctor people learn to ignore, and then it stops
+        # catching the configurations that are genuinely broken.
+        report_pass "no pre-push floor — posture is 'observe' and it was declined" \
+            "Nothing stops a push from a terminal. This is the recorded choice," \
+            "not a gap. Install it when the baseline is clear:" \
+            "  ./prism promote --all"
+    else
+        report_fail "no pre-push hook" \
+            "This is the enforcement floor — the only gate that works with no" \
+            "agent at all, and the PRIMARY gate on harnesses whose hooks fail" \
+            "open on timeout. Install: sh .prism/adapters/git/install.sh"
+    fi
+
+    # D7 — the config the gates read. config.sh denies when this is unreadable,
+    # so a broken file here blocks every gate rather than loosening one.
+    cfg="$PRISM_ROOT/.prism/prism.json"
+    if [ ! -f "$cfg" ]; then
+        report_fail "no .prism/prism.json" \
+            "Every gate reads it and DENIES when it is missing — by design."
+    elif python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$cfg" 2>/dev/null; then
+        base=$(python3 -c "
+import json,sys
+print(json.load(open(sys.argv[1])).get('baseBranch',''))" "$cfg" 2>/dev/null)
+        if [ -z "$base" ]; then
+            report_fail "prism.json declares no baseBranch" \
+                "Scope calculation cannot run without it."
+        elif ( cd "$PRISM_ROOT" && git rev-parse --verify "$base" >/dev/null 2>&1 ); then
+            report_pass "prism.json parses; baseBranch '$base' resolves"
+        else
+            report_fail "baseBranch '$base' does not resolve in this repository" \
+                "Every gate computes its scope against it, so every gate will deny." \
+                "Set it to a branch that exists: git branch -a"
+        fi
+    else
+        report_fail ".prism/prism.json is not valid JSON" \
+            "config.sh will deny on every gate until this parses."
+        return
+    fi
+
+    # D10 — the record, CHECKED AGAINST WHAT ACTUALLY BLOCKS. No gate reads the
+    # posture key, and tests/test_base_branch.sh asserts that none does, so this
+    # check may never trust it alone: it reads .prism/scope.json, which is what
+    # the engines read, and reports the DIFFERENCE between the two. Agreement is
+    # not assumed and it is not asserted -- it is measured.
+    recorded=$(prism_posture)
+    reality=$(prism_scope_reality)
+    case "$recorded" in
+        absent)
+            # Older installs predate the key. Say which way it was read rather
+            # than assuming silently.
+            recorded_label="no posture recorded — reading this install as 'enforce'"
+            recorded=enforce ;;
+        enforce) recorded_label="posture: enforce" ;;
+        observe) recorded_label="posture: observe" ;;
+        mixed)   recorded_label="posture: mixed" ;;
+        *)       recorded_label="" ;;
+    esac
+
+    if [ -z "$recorded_label" ]; then
+        report_fail "'${recorded#invalid:}' is not a posture" \
+            "Use \"observe\", \"mixed\" or \"enforce\" in .prism/prism.json." \
+            "Every sentence this report makes about the floor depends on it."
+    elif [ "$reality" = unreadable ]; then
+        report_undetermined ".prism/scope.json exists and cannot be read" \
+            "Every engine reads it to decide whether to fail the build, so this" \
+            "install's real posture cannot be stated." \
+            "An inability to ask the question is not an answer of no."
+    elif [ "$(prism_posture_strength "$recorded")" -gt "$(prism_posture_strength "$reality")" ]; then
+        # THE ONE DANGEROUS DIRECTION: the record claims more blocking than the
+        # file delivers. Compared as strengths rather than as named pairs, so a
+        # third value could not open a gap the way adding `mixed` would have.
+        report_fail "$recorded_label — but scope.json resolves to '$reality', which blocks less" \
+            "The key is a record. .prism/scope.json is the decision, and it is the" \
+            "only one of the two that any engine reads. This install reports that" \
+            "it blocks more than actually happens." \
+            "Enforce is installed by REMOVING .prism/scope.json, not by writing the" \
+            "word into it: with no scope file every engine enforces everywhere."
+    elif [ "$recorded" != "$reality" ]; then
+        # The safe direction: reality blocks MORE than the record claims. Worth
+        # saying, never worth failing.
+        #
+        # It does NOT say why, and it used to. The old text asserted "the
+        # baselines were worked down and scope.json removed" -- a history this
+        # check never looks at, and which was false on the first repository that
+        # hit it: the baselines were untouched and still held 15 findings.
+        if [ "$reality" = mixed ]; then
+            reality_note="partially promoted"
+        else
+            reality_note="resolves to '$reality'"
+        fi
+        report_pass "$recorded_label — $reality_note, which blocks MORE than the record claims" \
+            "The record is behind what is installed, not ahead of it, so nothing" \
+            "is over-reported. Update it to '$reality' when convenient." \
+            "./prism status names what blocks, per module and per engine."
+    else
+        report_pass "$recorded_label — and .prism/scope.json agrees" \
+            "No gate reads this key; the agreement was measured, not assumed."
+    fi
+
+    # D11 — the baselines. Reads files and counts; runs no Gradle. What is
+    # suppressed is the one number that says how far a report-only install is
+    # from enforcing, so it belongs in the verdict rather than in a skill.
+    #
+    # ONE PER MODULE since 0.6.0, so this asks baseline.py about the TREE rather
+    # than stat-ing a root file. A root detekt.baseline.xml is now just the root
+    # project's own, and a repository that still has one from 0.5.0 is counted
+    # like any other — the numbers stay honest either way.
+    baseline_py="$PRISM_ROOT/.prism/verify/lib/baseline.py"
+    [ -f "$baseline_py" ] || baseline_py="$HOOK_DIR/lib/baseline.py"
+    if ! command -v python3 >/dev/null 2>&1; then
+        report_undetermined "cannot read the detekt baselines: no python3" \
+            "An inability to ask the question is not an answer of no."
+    else
+        counts=$(python3 "$baseline_py" count --root "$PRISM_ROOT" 2>/dev/null)
+        count_status=$?
+        # The first field. baseline.py used to lead with `current=`, detekt's
+        # tag name for the entries that DO NOT block -- this line has always
+        # read it as the suppressed count, correctly, while `./prism status`
+        # printed the same line verbatim and so read it backwards. The field is
+        # named for what it means now.
+        suppressed=${counts#suppressed=}
+        suppressed=${suppressed%% *}
+        stale=$(printf '%s' "$counts" | sed -n 's/.*stale=\([0-9]*\).*/\1/p' | head -1)
+        case "$count_status" in
+            0) ;;
+            # 3 is EXIT_ABSENT: no module has a baseline at all. Absent and empty
+            # are deliberately the same verdict — somebody who worked their
+            # findings to zero and deleted the files is in the GOOD state.
+            3) suppressed=0 ;;
+            *) suppressed="" ;;
+        esac
+        if [ -z "$suppressed" ]; then
+            report_fail "a detekt baseline does not parse" \
+                "detekt fails EVERY module's analysis on an invalid baseline, so this" \
+                "is a broken build rather than an empty baseline. Which file it is:" \
+                "  python3 .prism/verify/lib/baseline.py count"
+        elif [ "$suppressed" = "0" ]; then
+            if [ "$(prism_posture)" = "observe" ]; then
+                report_pass "nothing suppressed — nothing left to burn down" \
+                    "Turn enforcement on: ./prism promote --all"
+            else
+                report_pass "nothing suppressed — every rule reports on every file"
+            fi
+        else
+            report_pass "detekt baselines: $suppressed findings suppressed" \
+                "These were present at install and do not block; a NEW violation" \
+                "of the same rule still does. See them by rule, worst first:" \
+                "  python3 .prism/verify/lib/baseline.py group"
+        fi
+        # A baseline id carries the BARE FILENAME, so renaming a file detaches
+        # its entries and those findings block again. Reported rather than
+        # failed: a rename is not a defect, and the point is that the red build
+        # it causes should be legible as "we renamed five files" rather than as
+        # "detekt regressed".
+        if [ -n "${stale:-}" ] && [ "${stale:-0}" != "0" ]; then
+            report_pass "$stale baselined file name(s) are no longer in their module" \
+                "Those entries match nothing now, so the findings they used to" \
+                "suppress are live. Which ones:" \
+                "  python3 .prism/verify/lib/baseline.py count"
+        fi
+    fi
+
+    # D12 — superseded class-output directories. Housekeeping, not wiring, so
+    # it never fails: coverage asks the compile task where it wrote and does
+    # not read these paths. It is reported because the residue is invisible
+    # otherwise and, before the init scripts stopped guessing at paths, it was
+    # what made coverage unmeasurable on 20 of one repository's 26 modules --
+    # a ten-month-old AGP 8.x tree the 9.x upgrade never removed.
+    classdirs_py="$PRISM_ROOT/.prism/verify/lib/classdirs.py"
+    [ -f "$classdirs_py" ] || classdirs_py="$HOOK_DIR/lib/classdirs.py"
+    if [ ! -f "$classdirs_py" ] || ! command -v python3 >/dev/null 2>&1; then
+        : # not a question this install can ask, and nothing depends on it
+    elif ! classdirs_out=$(python3 "$classdirs_py" report --root "$PRISM_ROOT" 2>/dev/null); then
+        : # a build tree that cannot be walked is not a finding
+    else
+        case "$classdirs_out" in
+            "no superseded"*)
+                report_pass "no superseded class-output directories" ;;
+            *)
+                classdirs_n=$(printf '%s\n' "$classdirs_out" \
+                    | sed -n 's/^\([0-9][0-9]*\) module(s) carry.*/\1/p')
+                report_pass "${classdirs_n:-some} module(s) keep an AGP 8.x class-output tree" \
+                    "Left by an AGP upgrade; nothing but a clean removes it. Coverage" \
+                    "does not read these paths, so this is housekeeping, not a fault:" \
+                    "  python3 .prism/verify/lib/classdirs.py sweep" ;;
+        esac
+    fi
+}
+
+# ---------------------------------------------------------------------------
+if [ "$MODE" = "detect" ]; then
+    # Answers a question about the MACHINE, not the repository, so it runs
+    # before anything is installed and needs neither engine nor config.
+    detect
+    exit $?
+elif [ "$MODE" = "preflight" ]; then
+    preflight
+else
+    # The engine's helpers, for module enumeration. Sourced only in postflight:
+    # preflight runs before the engine is installed and must not need it.
+    if [ -f "$HOOK_DIR/lib/affected.sh" ]; then
+        # shellcheck disable=SC1091
+        . "$HOOK_DIR/lib/affected.sh"
+    fi
+    # Both are normally set by affected.sh. Defaulted here so a doctor run in a
+    # tree where the engine could not be sourced still reports UNDETERMINED
+    # rather than dying on an unset variable under `set -u`.
+    PRISM_LIB_DIR="${PRISM_LIB_DIR:-$HOOK_DIR/lib}"
+    PRISM_ASSETS_DIR="${PRISM_ASSETS_DIR:-$PRISM_ROOT/.prism/assets}"
+    [ -d "$PRISM_ASSETS_DIR" ] || PRISM_ASSETS_DIR="$HOOK_DIR/../assets"
+    postflight
+fi
+
+printf '\n'
+if [ "$fail_count" -eq 0 ] && [ "$undetermined_count" -eq 0 ]; then
+    printf 'PASS — %d checks.\n' "$pass_count"
+    exit 0
+fi
+if [ "$undetermined_count" -gt 0 ] && [ "$fail_count" -eq 0 ]; then
+    printf 'UNDETERMINED — %d passed, %d could not be decided.\n' \
+        "$pass_count" "$undetermined_count"
+    printf 'Not a pass. An inability to ask the question is not an answer of no.\n'
+    exit 2
+fi
+printf 'FAIL — %d passed, %d failed, %d undetermined.\n' \
+    "$pass_count" "$fail_count" "$undetermined_count"
+exit 1

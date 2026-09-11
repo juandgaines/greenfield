@@ -1,0 +1,26 @@
+{
+  "$comment": [
+    "Which engines BLOCK, per module. Read live on every run; nothing is",
+    "regenerated from it. Edit it directly.",
+    "",
+    "ITS ABSENCE IS NOT NEUTRAL. With no scope file every engine enforces in",
+    "every module, so DELETING this file is how you finish adopting, not how",
+    "you opt out. The push guard refuses to let it reappear.",
+    "",
+    "  observe   the engine runs, writes its reports, and does not fail the",
+    "            build. The rules are NOT off and the findings are NOT hidden.",
+    "  enforce   findings fail the build.",
+    "",
+    "AN ENGINE THIS FILE DOES NOT NAME ENFORCES. Every key here is therefore a",
+    "deliberate exception, and the shortest honest file is the best one. That is",
+    "why step 8b writes only the engines that cannot enforce yet: a repository",
+    "whose findings can be recorded in a baseline starts BLOCKING on day one,",
+    "with today's findings quiet and a new violation refused.",
+    "",
+    "Written by verify/lib/scope.py. `./prism status` reports what it resolves."
+  ],
+  "default": {
+    "coverage": "observe"
+  },
+  "modules": {}
+}

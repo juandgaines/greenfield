@@ -1,0 +1,212 @@
+#!/bin/sh
+# The one entry point every harness registers.
+#
+# Five harnesses, four gates, and twenty different ways of saying the same
+# thing. This is the seam: it translates the harness's event into the shape the
+# gates already read, runs the gate, and translates the gate's answer back into
+# the harness's blocking protocol. The gates learn nothing about harnesses and
+# the harnesses see nothing of the gates.
+#
+#   prism-hook --harness <name> --gate <push|ktlint|stop|subagent>
+#
+# WHY A DISPATCHER RATHER THAN FIVE COPIES. The alternative is a per-harness
+# script per gate -- twenty files that must stay in step with four gates and one
+# canonical payload. Every one of them would be a place for a harness to drift
+# out of sync silently, and silence is the failure mode this framework exists to
+# remove. One file, one translation table, one place to test.
+#
+# THE TWO HALVES OF THE SEAM. `normalise.py` translates inbound; `emit.py`
+# translates outbound. Three harnesses -- Claude Code, Codex, Copilot -- read
+# the process exit status, so for them the outbound half passes the status
+# through untouched. Two -- Cursor and Antigravity -- decide from a JSON
+# document on stdout, and for those an empty stdout is not "allow" but a FAILED
+# HOOK; with Cursor's `failClosed: true` a failed hook blocks. Every exit in
+# this file therefore goes through `emit_decision`, including the early ones:
+# a `no-event` allow that printed nothing was, on Cursor, a block.
+set -u
+
+usage() {
+    # Deliberately a bare exit: this fires before $HARNESS and $GATE are known,
+    # and a malformed invocation is not a gate verdict to be translated.
+    printf 'usage: prism-hook --harness <name> --gate <push|ktlint|stop|subagent>\n' >&2
+    exit 2
+}
+
+HARNESS=""
+GATE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --harness) [ $# -ge 2 ] || usage; HARNESS="$2"; shift 2 ;;
+        --gate)    [ $# -ge 2 ] || usage; GATE="$2"; shift 2 ;;
+        *) usage ;;
+    esac
+done
+[ -n "$HARNESS" ] && [ -n "$GATE" ] || usage
+
+ADAPTER_LIB=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PRISM_HOME=$(dirname -- "$(dirname -- "$ADAPTER_LIB")")
+ENGINE="${PRISM_ENGINE_DIR:-$PRISM_HOME/verify}"
+NORMALISE="$ADAPTER_LIB/normalise.py"
+EMIT="$ADAPTER_LIB/emit.py"
+
+case "$GATE" in
+    push)     GATE_SCRIPT="$ENGINE/push-gate.sh" ;;
+    ktlint)   GATE_SCRIPT="$ENGINE/ktlint.sh" ;;
+    stop)     GATE_SCRIPT="$ENGINE/stop-gate.sh" ;;
+    subagent) GATE_SCRIPT="$ENGINE/subagent-gate.sh" ;;
+    *) usage ;;
+esac
+
+# THE OUTPUT LEG, in one place, reached from every exit below.
+#
+#   emit_decision <gate-status> [reason-text] [gate-stdout]
+#
+# It used to be one branch at the very end, for one harness. Every other exit --
+# a no-event allow, a missing engine, an unreadable payload -- returned an exit
+# code and an EMPTY STDOUT. That is a verdict on the three harnesses that read
+# exit codes and a failed hook on the two that read a JSON document, which is
+# why Cursor blocked every shell command the gate was perfectly happy with.
+#
+# The reason text comes from the gate's stderr rather than its stdout on
+# purpose: `prism_report` in lib/affected.sh writes the same text to both, and
+# its stdout copy is Claude Code's `{"systemMessage": ...}` -- another harness's
+# vocabulary, which must not be forwarded verbatim to Cursor or Antigravity.
+emit_decision() {
+    ed_status="$1"
+    ed_message="${2:-}"
+    ed_stdout="${3:-}"
+
+    ed_out=$(printf '%s' "$ed_message" \
+        | python3 "$EMIT" "$HARNESS" "$GATE" "$ed_status" 2>/dev/null)
+
+    if [ -n "$ed_out" ]; then
+        ed_head=$(printf '%s' "$ed_out" | head -1)
+        ed_exit=${ed_head%% *}
+        ed_policy=${ed_head#* }
+        ed_document=$(printf '%s' "$ed_out" | sed '1d')
+    else
+        # python3 already ran once by this point, for normalise.py, so losing it
+        # here is vanishingly rare -- except on the one path where python3 is
+        # exactly what failed. A verdict that cannot be PHRASED must still be
+        # DELIVERED, and this fallback may only ever over-block, never under.
+        ed_exit="$ed_status"
+        ed_policy="document"
+        case "$HARNESS:$GATE" in
+            cursor:push)
+                ed_document='{"permission":"allow"}'
+                [ "$ed_status" -ne 0 ] && ed_document='{"permission":"deny","agent_message":"prism-verify denied this action."}'
+                ;;
+            cursor:stop|cursor:subagent)
+                ed_exit=0
+                ed_document='{}'
+                [ "$ed_status" -ne 0 ] && ed_document='{"followup_message":"prism-verify: verification did not pass."}'
+                ;;
+            cursor:*)
+                ed_exit=0
+                ed_document='{}'
+                ;;
+            antigravity:push)
+                ed_exit=0
+                ed_document='{"decision":"allow"}'
+                [ "$ed_status" -ne 0 ] && ed_document='{"decision":"deny","reason":"prism-verify denied this action."}'
+                ;;
+            antigravity:stop)
+                ed_exit=0
+                ed_document='{}'
+                [ "$ed_status" -ne 0 ] && ed_document='{"decision":"continue","reason":"prism-verify: verification did not pass."}'
+                ;;
+            antigravity:*)
+                ed_exit=0
+                ed_document='{}'
+                ;;
+            *)
+                ed_policy="passthrough"
+                ;;
+        esac
+    fi
+
+    if [ "$ed_policy" = "passthrough" ]; then
+        [ -n "$ed_stdout" ] && printf '%s' "$ed_stdout"
+    else
+        printf '%s\n' "$ed_document"
+    fi
+    [ -n "$ed_message" ] && printf '%s\n' "$ed_message" >&2
+    exit "$ed_exit"
+}
+
+# A missing engine is a broken install, and on a blocking gate it must deny.
+# Allowing here would mean an uninstalled framework reports the same thing as a
+# clean run: nothing.
+if [ ! -f "$GATE_SCRIPT" ]; then
+    if [ "$GATE" = "push" ]; then
+        emit_decision 2 "$(printf 'prism-verify: the engine is not at %s, so this push cannot be verified.\nprism-verify: re-run setup, or remove this hook registration.' "$ENGINE")"
+    fi
+    emit_decision 0
+fi
+
+input=$(cat)
+
+# python3 is a hard prerequisite of the engine already -- push-gate.sh denies
+# outright when it cannot be run, on the argument that an interpreter that
+# cannot be asked the question must not be read as "nothing to check". The same
+# argument applies one layer earlier, here.
+#
+# This is the one path where emit_decision's static fallback is not merely
+# theoretical: if python3 is missing, emit.py cannot run either.
+if ! translated=$(printf '%s' "$input" | python3 "$NORMALISE" "$HARNESS" "$GATE" 2>/dev/null); then
+    if [ "$GATE" = "push" ]; then
+        emit_decision 2 "$(printf 'prism-verify: could not translate the %s hook event (python3 unavailable?).\nprism-verify: denying rather than allowing an unverified push.' "$HARNESS")"
+    fi
+    emit_decision 0
+fi
+
+status=$(printf '%s' "$translated" | head -1)
+payload=$(printf '%s' "$translated" | sed '1d')
+
+case "$status" in
+    no-event)
+        # Understood, and there is nothing this gate looks at -- a Read event
+        # reaching the push gate, an edit to a file that is not Kotlin. Allow.
+        #
+        # This is the most frequent path on any harness, which is why it must
+        # speak the harness's vocabulary rather than exiting silently.
+        emit_decision 0
+        ;;
+    ok)
+        : # fall through with $payload
+        ;;
+    *)
+        # NOT understood. The push gate denies; the turn-end and subagent gates
+        # take the engine's own documented path for an unreadable event, which
+        # is to say so and verify anyway. Only ktlint, which reports and never
+        # blocks, has nothing useful to do without a file path.
+        case "$GATE" in
+            push)
+                emit_decision 2 "$(printf 'prism-verify: this %s event could not be read, so the command in it could not be checked.\nprism-verify: denying rather than allowing an unverified push.' "$HARNESS")"
+                ;;
+            ktlint) emit_decision 0 ;;
+            *) payload='{}' ;;
+        esac
+        ;;
+esac
+
+# --- run the gate --------------------------------------------------------
+#
+# stderr is captured rather than passed through because the document harnesses
+# need the reason as a JSON string rather than as stderr text. For the exit-code
+# harnesses emit_decision writes it straight back out, unchanged.
+stderr_file=$(mktemp -t prism-hook-stderr) || {
+    if [ "$GATE" = "push" ]; then
+        emit_decision 2 "prism-verify: could not create a temporary file; denying."
+    fi
+    emit_decision 0
+}
+trap 'rm -f "$stderr_file"' EXIT INT TERM HUP
+
+stdout_text=$(printf '%s' "$payload" | sh "$GATE_SCRIPT" 2>"$stderr_file")
+gate_status=$?
+stderr_text=$(cat "$stderr_file")
+rm -f "$stderr_file"
+trap - EXIT INT TERM HUP
+
+emit_decision "$gate_status" "$stderr_text" "$stdout_text"

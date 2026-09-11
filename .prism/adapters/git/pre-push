@@ -1,0 +1,72 @@
+#!/bin/sh
+# prism-verify: the enforcement floor.
+#
+# Runs Principle VII's gates before git sends anything to a remote. Exit 0 lets
+# the push proceed; any other status aborts it.
+#
+# This is the ONLY enforcement path that does not belong to a harness, and on
+# two of the five supported harnesses it is the primary one rather than a
+# fallback. Per docs/harness-capability-matrix.md, Copilot CLI documents hook
+# timeouts as "always fail-open, even for preToolUse and admin-deployed policy
+# hooks", at a 30 second default; Antigravity defaults to 30 seconds with no
+# documented maximum. The gates this triggers run static analysis, a build and a
+# coverage pass, and are registered at 3600 seconds where a harness allows it.
+# A gate that fails open on timeout is not a slower gate, it is an absent one.
+#
+# It constructs no synthetic harness event. Git already knows the command is a
+# push and which refs it carries, so this calls the verification half of the
+# push gate directly — the half that takes a ref rather than an event. That
+# split is why the floor needs no shim.
+#
+# Git calls it as:  pre-push <remote-name> <remote-url>
+# with one line per ref on stdin:  <local-ref> <local-sha> <remote-ref> <remote-sha>
+#
+# PRISM_ADAPTER_MARKER: prism-verify/adapters/git/pre-push
+set -u
+
+prism_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+if [ -z "$prism_root" ]; then
+    exit 0
+fi
+
+prism_verify="$prism_root/.prism/verify/push-verify.sh"
+if [ ! -f "$prism_verify" ]; then
+    printf 'PUSH DENIED — prism-verify is installed as a git hook but its engine\n' >&2
+    printf 'is missing.\n\n' >&2
+    printf 'Expected: %s\n\n' "$prism_verify" >&2
+    printf 'A hook that cannot find its gates has not verified anything, and\n' >&2
+    printf 'saying so is the whole reason it is here. Reinstall prism-verify, or\n' >&2
+    printf 'remove .git/hooks/pre-push if you meant to uninstall it.\n' >&2
+    exit 2
+fi
+
+# The ref being sent, read from git's own input rather than reconstructed.
+#
+# A deletion carries an all-zero local sha and ships no commits, so it is
+# skipped for the same reason push_detect.py classifies `--delete` as skip: an
+# hour of instrumentation would verify nothing relevant to what is being sent.
+# When every ref in the push is a deletion there is nothing to gate.
+#
+# stdin may be absent entirely — a `git push` with no matching refs, or a caller
+# invoking this hook directly. Empty means HEAD, which is what the harness path
+# resolves to when a refspec names no source ref.
+prism_ref=""
+prism_saw_ref="no"
+while read -r prism_local_ref prism_local_sha prism_remote_ref prism_remote_sha; do
+    [ -n "$prism_local_ref" ] || continue
+    prism_saw_ref="yes"
+    case "$prism_local_sha" in
+        ''|*[!0]*)
+            if [ -z "$prism_ref" ]; then
+                prism_ref="$prism_local_ref"
+            fi
+            ;;
+        *) ;;   # all zeros: a deletion
+    esac
+done
+
+if [ "$prism_saw_ref" = "yes" ] && [ -z "$prism_ref" ]; then
+    exit 0
+fi
+
+exec sh "$prism_verify" "$prism_ref"

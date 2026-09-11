@@ -1,0 +1,695 @@
+# The single source of truth for the detekt rule set.
+#
+# No rule is enabled, disabled, or parameterised anywhere else — not in a build
+# script, not in a convention plugin — exactly as `.editorconfig` is the only
+# surface for ktlint. `buildUponDefaultConfig` is on, so this file records only
+# the deltas from detekt's defaults.
+#
+# The governing constraint: no rule may be active in a configuration where it
+# reports code that follows this project's documented conventions. Where a rule
+# is valuable but its defaults report correct code it is scoped — by annotation,
+# by path, or by parameter — rather than left to produce noise.
+
+config:
+  # Load-bearing. Without this a misspelled or stale rule name does nothing,
+  # silently, forever: a rule renamed upstream or a rule set dropped from
+  # `detektPlugins` would leave a gate that reports clean because it stopped
+  # checking. Observed during design, hence mandatory rather than optional.
+  validation: true
+  warningsAsErrors: false
+
+complexity:
+  # An MVI `onAction` and a DTO mapper are single `when` expressions whose branch
+  # count is the number of actions or event types they handle -- that is the shape
+  # the architecture asks for, not accumulated complexity, and splitting one up
+  # would only scatter the dispatch.
+  CyclomaticComplexMethod:
+    ignoreSingleWhenExpression: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  LongMethod:
+    excludes: ['**/test/**', '**/androidTest/**', '**/presentation/**', '**/designsystem/**']
+  LongParameterList:
+    excludes: ['**/test/**', '**/androidTest/**', '**/presentation/**', '**/designsystem/**']
+  # A DTO mapper file is one private function per payload type, which is cohesion
+  # rather than a file doing too much; the internal surface is what the threshold
+  # is really about.
+  TooManyFunctions:
+    excludes: ['**/test/**', '**/androidTest/**', '**/presentation/**', '**/designsystem/**']
+    ignorePrivate: true
+
+empty-blocks:
+  # An interface method implemented with an empty body is the normal shape of a
+  # test double, not a defect.
+  EmptyFunctionBlock:
+    excludes: ['**/test/**', '**/androidTest/**']
+
+exceptions:
+  # These two fire at the layer edges where an external throw is caught and
+  # converted into a typed error -- a safe-call wrapper, a remote data source,
+  # a crypto boundary. Those places are correct and the rest are not, so the
+  # rules stay ACTIVE and the sanctioned files are enumerated below instead.
+  #
+  # The convention is the part worth keeping: one file at a time, never a
+  # directory glob, so that widening the list is a visible, reviewable act, and
+  # a new place that swallows a generic exception fails the build until someone
+  # adds it deliberately.
+  #
+  # The list ships EMPTY because those files are yours, not ours. Expect both
+  # rules to fire on your first run; add each edge you actually sanction:
+  #
+  #   excludes:
+  #     - '**/test/**'
+  #     - '**/androidTest/**'
+  #     - '**/data/networking/SafeCall.kt'
+  TooGenericExceptionCaught:
+    excludes:
+      - '**/test/**'
+      - '**/androidTest/**'
+  InstanceOfCheckForException:
+    excludes:
+      - '**/test/**'
+      - '**/androidTest/**'
+
+coroutines:
+  GlobalCoroutineUsage:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+
+  # Fires only in the type-resolving tasks. The exemption this list is for is a
+  # CPU-bound utility that pins its own work to Dispatchers.Default by design,
+  # where the injectable seam is the algorithm rather than the dispatcher.
+  # Enumerated per file, never a directory glob, so the next hardcoded
+  # dispatcher still fails.
+  #
+  # Ships empty. Add yours if and when this fires on one.
+  InjectDispatcher:
+    excludes:
+      - '**/test/**'
+      - '**/androidTest/**'
+
+naming:
+  # Composables are PascalCase by the Compose naming convention. Without this the
+  # rule reports 233 correct functions.
+  FunctionNaming:
+    ignoreAnnotated: ['Composable']
+
+  # A design system names a file after the component or the theme topic it
+  # defines -- AppDialog.kt holds the AppDialog composable and the
+  # AppDialogVariant enum it takes; Spacing.kt holds the spacing tokens. That
+  # is the better name in both cases, and the rule only objects when the
+  # supporting type happens to be the file's first declaration: Shapes.kt and
+  # Type.kt have the identical shape and escape purely on ordering. A rule that
+  # fires on declaration order rather than on the property it claims to check is
+  # reporting correct code, so it is scoped out of that package rather than
+  # answered with six files that exist only to satisfy it. It stays active
+  # everywhere else, where it caught a real mismatch.
+  MatchingDeclarationName:
+    excludes: ['**/test/**', '**/androidTest/**', '**/designsystem/**']
+
+style:
+  # ktlint owns these three. Running them here would double-report the same line.
+  MaxLineLength:
+    active: false
+  NewLineAtEndOfFile:
+    active: false
+  WildcardImport:
+    active: false
+
+  DestructuringDeclarationWithTooManyEntries:
+    excludes: ['**/test/**', '**/androidTest/**']
+
+  # A test asserting the equals contract has to call equals(null) -- `== null`
+  # would test something else entirely.
+  EqualsNullCall:
+    excludes: ['**/test/**', '**/androidTest/**']
+
+  # The two stacks the constitution names as forbidden. Both are clean today;
+  # these entries cost no code and stop the door from opening.
+  ForbiddenImport:
+    active: true
+    forbiddenImports:
+      - value: 'io.reactivex.**'
+        reason: 'The constitution forbids RxJava. Use Kotlin coroutines and Flow.'
+      - value: 'rx.**'
+        reason: 'The constitution forbids RxJava. Use Kotlin coroutines and Flow.'
+      - value: 'android.database.sqlite.**'
+        reason: 'The constitution forbids raw SQLite. Use Room.'
+
+  # Inside the design-system theme the numbers are the design tokens.
+  # Deliberately NOT under THEME_RULES_ACTIVE. This is a general rule about
+  # magic numbers everywhere; the theme paths are one carve-out for the token
+  # definition site, and a glob that matches nothing excludes nothing. In a
+  # repository with no design system the rule is still correct, so switching it
+  # off through a knob named "theme" would remove a check nobody asked to lose.
+  MagicNumber:
+    excludes:
+      - '**/test/**'
+      - '**/androidTest/**'
+      - '**/theme/**'
+
+  # Guard clauses are the idiom for validating input and returning a typed error,
+  # and the crypto modules are full of them by design: each early return is one
+  # named rejection reason, which is what makes the validation auditable. Counting
+  # them punishes exactly the shape the project wants, so they are excluded and the
+  # limit applies to the branching that follows.
+  ReturnCount:
+    max: 3
+    excludeGuardClauses: true
+    excludes: ['**/test/**', '**/androidTest/**']
+
+  # A private @Preview has no call site by design, and that is not dead code.
+  # detekt 2.0 split UnusedPrivateMember by declaration kind; the preview
+  # exemption concerns functions.
+  UnusedPrivateFunction:
+    ignoreAnnotated: ['Preview', 'Composable']
+
+Compose:
+  # Material 3 is the project's design system; a Material 2 import is a defect.
+  Material2:
+    active: true
+  PreviewNaming:
+    active: true
+
+  # OFF because PRISM's own PreviewMustBePrivate says the same thing, with its
+  # own message and its own excludes. Both were firing, so one violation was
+  # reported twice: a freshly generated Android project has 2 public previews
+  # and produced 4 findings. Two rules for one concern does not catch more, it
+  # only inflates the number a consumer is asked to work down -- and the count
+  # at step 8b is evidence a decision is made from.
+  PreviewPublic:
+    active: false
+
+  # YOUR list, and it ships empty on purpose. A CompositionLocal not named here
+  # fails the build -- that is the rule working, not a misconfiguration.
+  #
+  # The intended use is a design system's own extension of MaterialTheme, the
+  # same mechanism Material uses for its schemes: enumerate the token holders
+  # you sanction, so that a sixth one added later has to be a deliberate edit to
+  # this list rather than a quiet import. Add yours as they appear:
+  #
+  #   allowedCompositionLocals:
+  #     - LocalAppExtendedColors
+  #     - LocalAppSpacing
+  CompositionLocalAllowlist:
+    allowedCompositionLocals: []
+
+  # A test harness composable is scaffolding, not a reusable component.
+  ModifierMissing:
+    excludes: ['**/test/**', '**/androidTest/**']
+
+# The project-specific rule set, supplied by :tooling:prism-rules. Its bundled
+# config declares only the rule names so that validation can see them; whether a
+# rule is on, and what it skips, is decided here.
+prism:
+  # ---------------------------------------------------------------------------
+  # Rules that hold everywhere. No layout, no library and no naming convention
+  # is assumed; they are about the language and the platform. Nothing below this
+  # banner is switchable at install, because there is no repository where the
+  # answer is "not applicable".
+  # ---------------------------------------------------------------------------
+  NonAtomicStateFlowAssignment:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  SingleLetterIdentifier:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NoConsoleLogging:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  IconContentDescription:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  IconButtonHardcodedSize:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  # --- Regression guards. These find nothing today; that is the point. They hold
+  # --- the line when an agent, or a hurried afternoon, is writing the code.
+  NoOpenClassInMain:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NoPublicMutableFlow:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NoRunBlockingInMain:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NoNotNullAssertion:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  # The @Preview exemption is inside the rule, not here: detekt applies
+  # ignoreAnnotated outside the rule, where its own tests cannot reach it.
+  HardcodedUserFacingString:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NoBareIconClickable:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NoComposableModifierExtension:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  CallbackFlowRequiresAwaitClose:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  # Resolution-backed (RequiresAnalysisApi): runs only in the type-resolving
+  # detekt tasks, where the compile classpath is available. A generic catch in
+  # a suspending context must rethrow CancellationException or call
+  # ensureActive() before any other handling.
+  SuspendGenericCatchSwallowsCancellation:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  SealedHierarchyOfOnlyObjectsShouldBeEnum:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NoImplSuffix:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NoResultListOfErrors:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  SharedFlowRequiresExplicitBuffer:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  OneShotFlowBuilder:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  CustomScopeRequiresSupervisorJob:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  CollectAsStateWithoutLifecycle:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  UniqueWorkNameIsSnakeCase:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  StartForegroundViaServiceCompat:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  DispatchersSetMainWithoutReset:
+    active: true
+    includes: ['**/test/**', '**/androidTest/**']
+  InMemoryRoomNotClosed:
+    active: true
+    includes: ['**/test/**', '**/androidTest/**']
+  AdaptiveLayoutOwnsNoState:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  KoinModuleNaming:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  PreferConstructorReferenceKoinDefinition:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  HttpClientMustAcceptEngine:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NoSharedPreferencesForTokens:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  ThreadSleepOrEspressoIdleInTest:
+    active: true
+    includes: ['**/test/**', '**/androidTest/**']
+  ReflectionInTest:
+    active: true
+    includes: ['**/test/**', '**/androidTest/**']
+  ModifierParameterDefaultIsModifier:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  ModifierParameterAfterRequiredParameters:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  ComposableSlotParameterAfterModifier:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NoPreviewParameterAnnotation:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  PreviewMustBePrivate:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  PreviewFunctionNaming:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  # ktlint never inserts blank lines, so readable grouping has to be demanded
+  # here. The rule flags the wall; the author picks the group boundaries.
+  CrammedBlockBody:
+    active: true
+    maxRunLength: 5
+    excludes: ['**/test/**', '**/androidTest/**']
+  ClassBodyMissingLeadingBlankLine:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+
+  # ---------------------------------------------------------------------------
+  # PALETTE RULES — group switch PALETTE_RULES_ACTIVE (currently @PALETTE_RULES_ACTIVE@)
+  #
+  # These two need the NAME of the declaration that holds your raw colours, and
+  # they are the only two rules in the set that do.
+  #
+  # TO CHANGE THIS
+  #   switch      PALETTE_RULES_ACTIVE = true | false
+  #   guards      PALETTE_OBJECT, EXTENDED_TOKEN_HOLDER
+  #   set false   when NO declaration holds the raw colours -- when the palette
+  #               is a set of top-level vals rather than an object, a class or
+  #               a data class. Then both names take 'none'.
+  #   set true    only with real names. A placeholder name ('none', 'n/a',
+  #               'TODO') beside an ACTIVE rule is REFUSED -- by render.py at
+  #               install, and by the rules themselves at runtime.
+  #   see         'Changing things' in the PRISM documentation folder,
+  #               'Adding or changing a group switch'
+  #
+  # WHY THESE TWO ARE NOT IN THE THEME GROUP. A wrong or placeholder name here
+  # is a SILENT GREEN: the rule runs, its receiver comparison never matches,
+  # and it reports success over the code it was pointed at. A repository can
+  # genuinely have a theme composable and a theme package and still have no
+  # palette declaration to name -- that shape had no honest answer while all
+  # five rules shared one switch, and an install wrote 'none' with the rules
+  # left on rather than lose the other three.
+  #
+  # SWITCHING THIS OFF DOES NOT MAKE RAW-COLOUR USE LEGAL. It means no rule in
+  # the set can express it. Record that in .prism/INSTALL-RECORD.md rather than
+  # letting the gap disappear.
+  # ---------------------------------------------------------------------------
+  # References inside the theme package are what BUILD the colour scheme, so the
+  # exclusion is the whole difference between defining and consuming.
+  ThemeColorDirectUse:
+    active: @PALETTE_RULES_ACTIVE@
+    excludes: ['**/test/**', '**/androidTest/**', '**/theme/**']
+    # The declaration holding your raw colours: object, class or data class.
+    paletteObject: '@PALETTE_OBJECT@'
+  UnwiredThemeColor:
+    active: @PALETTE_RULES_ACTIVE@
+    excludes: ['**/test/**', '**/androidTest/**']
+    paletteObject: '@PALETTE_OBJECT@'
+    # The class carrying your extended colour tokens, usually beside the palette.
+    extendedTokenHolder: '@EXTENDED_TOKEN_HOLDER@'
+
+  # ---------------------------------------------------------------------------
+  # THEME RULES — group switch THEME_RULES_ACTIVE (currently @THEME_RULES_ACTIVE@)
+  #
+  # These three assume the repository has a theme composable and a package where
+  # colour tokens and CompositionLocals are legitimately declared.
+  #
+  # TO CHANGE THIS
+  #   switch      THEME_RULES_ACTIVE = true | false
+  #   guards      THEME_OBJECT
+  #   set false   when there is no theme composable AND no theme package. Then
+  #               THEME_OBJECT takes 'none'.
+  #   set true    only with a real name; a placeholder is REFUSED, as above.
+  #   see         'Changing things' in the PRISM documentation folder,
+  #               'Adding or changing a group switch'
+  #
+  # ONE OF THEM CANNOT GUESS A NAME. PreviewMustWrapInTheme reads THEME_OBJECT,
+  # and a wrong name matches no call -- so every preview in the repository is
+  # reported, each message naming a composable you have never heard of. That
+  # failure is loud rather than silent, but a rule that flags every preview gets
+  # switched off and takes the two beside it.
+  #
+  # TWO OF THEM DEPEND ON A PATH. RawColorLiteral and NoCustomCompositionLocal
+  # exempt the theme package -- the sanctioned definition site. Where there is
+  # none, every colour token and every CompositionLocal the theme is built from
+  # is reported as a violation of a theme that does not exist. The excludes
+  # below name the common location; if yours is elsewhere, ADD THE PATH rather
+  # than switching the group off.
+  #
+  # style.MagicNumber deliberately stays outside this group. It is a general
+  # rule about magic numbers everywhere, and a glob that matches nothing
+  # excludes nothing -- so in a repository with no design system it is still
+  # correct, and switching it off through a knob named "theme" would remove a
+  # verification nobody asked to lose.
+  # ---------------------------------------------------------------------------
+  PreviewMustWrapInTheme:
+    active: @THEME_RULES_ACTIVE@
+    # YOUR theme composable -- the one every preview must wrap its content in.
+    themeName: '@THEME_OBJECT@'
+    excludes: ['**/test/**', '**/androidTest/**']
+  # Hex literals belong in the theme package, where they are the token definitions.
+  RawColorLiteral:
+    active: @THEME_RULES_ACTIVE@
+    excludes: ['**/test/**', '**/androidTest/**', '**/theme/**']
+  # The theme package is where the locals behind your theme's tokens are built
+  # (spacing, elevation, shapes), so the exclusion is the sanctioned creation site.
+  # Adjust the path to wherever your design system declares them.
+  NoCustomCompositionLocal:
+    active: @THEME_RULES_ACTIVE@
+    excludes: ['**/test/**', '**/androidTest/**', '**/theme/**']
+
+  # ---------------------------------------------------------------------------
+  # MVI PRESENTATION RULES -- 11 rules, always active
+  #
+  # These eleven assume one presentation shape: a `<Name>Root.kt` that owns
+  # the ViewModel and observes events, a `<Name>Screen.kt` that takes state
+  # and emits actions, state and action types under a `presentation`
+  # package, and a ViewModel exposing state through
+  # stateIn(..., WhileSubscribed).
+  #
+  # NONE OF THEM IS SCOPED BY PATH, and that is deliberate. Three used to
+  # be: ScreenStateOnlyInScreenComposable and StableAnnotationOnUnstableState
+  # by `includes: '**/presentation/**'`, ObserveAsEventsRequired by
+  # `includes: '**/*Root.kt'`. In a repository that named things differently
+  # those three did not report the wrong thing -- they matched nothing and
+  # passed, which reads as success.
+  #
+  # All three already scope themselves by what they are ABOUT: a `*State`
+  # class, an @Composable taking a `*State` parameter, a LaunchedEffect that
+  # collects. The path scoping added nothing except a way to silently
+  # receive no check.
+  #
+  # THESE USED TO BE SWITCHABLE. They are not any more, and the reason was
+  # measured: ten installs of one unchanged repository produced four different
+  # rule sets, because an agent read a paragraph like the one above and reached
+  # the opposite conclusion from another agent on identical code. What is
+  # CHECKED is now the same in every repository. What BLOCKS is yours to move.
+  #
+  # IF THESE FIRE EVERYWHERE
+  #   observe     set this engine to 'observe' for the module in
+  #               .prism/scope.json -- every finding is still reported, none of
+  #               them blocks. This is the right answer to 'this repository has
+  #               a lot of these'.
+  #   baseline    records what exists TODAY; a NEW violation still fails. This
+  #               is strictly better than the switch it replaces, which hid the
+  #               new ones too.
+  #   off         `active: false`, here, one rule at a time. Last resort: the
+  #               rule never comes back, and neither does the check.
+  #   see         'Changing things' in the PRISM documentation folder,
+  #               'The three meanings of off'
+  # ---------------------------------------------------------------------------
+  TextFieldStateInViewModel:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  # Scoped by nothing but its own subject: a LaunchedEffect that collects a
+  # flow. It used to carry `includes: ['**/*Root.kt']`, which was BOTH a naming
+  # convention this repository may not use AND strictly weaker than the rule's
+  # own claim -- a LaunchedEffect collecting in a *Screen.kt, arguably the worse
+  # place, went unreported. An `includes:` that matches nothing is the one glob
+  # failure that reads as success, so this direction gets no repository shape at
+  # all.
+  ObserveAsEventsRequired:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  StateInViewModelRequiresWhileSubscribed:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  # Scoped by NAME, not by path. The rule only looks at a class whose name ends
+  # in `State`, so a `includes: '**/presentation/**'` on top of that excluded
+  # nothing extra and silently excluded everything in a repository that keeps
+  # its state classes somewhere else.
+  StableAnnotationOnUnstableState:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  # Same: the rule already requires an @Composable taking a `*State` parameter,
+  # and already skips functions named `*Screen` and `*Root`.
+  ScreenStateOnlyInScreenComposable:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  RootAndScreenInSameFile:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  KoinViewModelOnlyInRoot:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  ObserveAsEventsOnlyInRoot:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  RootComposableMustDefaultViewModel:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  EventChannelExposedAsReceiveAsFlow:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  ScreenComposableParameterOrder:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+
+  # ---------------------------------------------------------------------------
+  # MODULE-PATH RULES -- 6 rules, always active
+  #
+  # Each of these six exempts the ONE place its pattern is legitimately
+  # implemented: the file wrapping the raw Ktor verbs, the file that builds
+  # the shared HttpClient, the file declaring each Result typealias, the
+  # Application class that may call startKoin, the module that wires every
+  # feature's routes.
+  #
+  # Where the exclusion matches nothing, the rule fires on the very file it
+  # was written to exempt -- the consumer's own wrapper, their own
+  # Application. The finding is real-looking and wrong.
+  #
+  # SO THESE NAME FILES, NOT DIRECTORIES, and that is what makes the globs
+  # portable: a file called SafeCall.kt is the safe-call wrapper wherever
+  # the repository keeps it, whereas '**/core/data/networking/**' is one
+  # project's folder tree and matches nothing anywhere else. Per-file also
+  # means a SECOND implementation site still fails, which a directory glob
+  # would have swallowed.
+  #
+  # IF YOUR SANCTIONED FILE HAS A DIFFERENT NAME, EDIT THE GLOB. One line,
+  # and you keep the check. Reach for observe or a baseline only when the
+  # repository has no networking seam, no Result type and no DI entry
+  # point -- nothing for these rules to be about.
+  #
+  # THESE USED TO BE SWITCHABLE. They are not any more, and the reason was
+  # measured: ten installs of one unchanged repository produced four different
+  # rule sets, because an agent read a paragraph like the one above and reached
+  # the opposite conclusion from another agent on identical code. What is
+  # CHECKED is now the same in every repository. What BLOCKS is yours to move.
+  #
+  # IF THESE FIRE EVERYWHERE
+  #   observe     set this engine to 'observe' for the module in
+  #               .prism/scope.json -- every finding is still reported, none of
+  #               them blocks. This is the right answer to 'this repository has
+  #               a lot of these'.
+  #   baseline    records what exists TODAY; a NEW violation still fails. This
+  #               is strictly better than the switch it replaces, which hid the
+  #               new ones too.
+  #   off         `active: false`, here, one rule at a time. Last resort: the
+  #               rule never comes back, and neither does the check.
+  #   see         'Changing things' in the PRISM documentation folder,
+  #               'The three meanings of off'
+  # ---------------------------------------------------------------------------
+  # The file wrapping the raw Ktor verbs has to call them directly.
+  KtorCallMustUseSafeCall:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**', '**/SafeCall.kt']
+  # The typealias declaration file is the one place Result<Unit, E> is spelled out.
+  EmptyResultOverResultUnit:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**', '**/Result.kt']
+  # The typealias declaration file is the one place ListenableWorker.Result may
+  # be spelled out.
+  WorkerResultTypealiasRequired:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**', '**/WorkerResult.kt']
+  # The module that wires the navigation graphs legitimately touches every
+  # feature's routes. `app` is the Android convention for it; this is the one
+  # glob here that names a directory, because "the module that wires everything"
+  # has no single file to name. Rename it if your entry module is called
+  # something else.
+  NoCrossFeatureRouteImport:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**', '**/app/src/**']
+  # The Application class is the one sanctioned startKoin site, wherever it lives.
+  StartKoinOnlyInAppModule:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**', '**/*Application.kt', '**/*App.kt']
+  # HttpClientFactory is where the shared client is built; enumerated per file,
+  # never a directory glob, so a second construction site still fails.
+  HttpClientConstructionOutsideFactory:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**', '**/HttpClientFactory.kt']
+
+  # ---------------------------------------------------------------------------
+  # NAVIGATION RULES -- 3 rules, always active
+  #
+  # These three assume type-safe Compose Navigation: @Serializable route
+  # types, data objects or data classes as routes, and per-feature
+  # NavGraphBuilder.<feature>Graph() extensions.
+  #
+  # On Navigation 3, a hand-rolled navigator, or single-Activity XML
+  # navigation they describe a convention the project never adopted. They
+  # will report it. Observe the module, or baseline what is there.
+  #
+  # THESE USED TO BE SWITCHABLE. They are not any more, and the reason was
+  # measured: ten installs of one unchanged repository produced four different
+  # rule sets, because an agent read a paragraph like the one above and reached
+  # the opposite conclusion from another agent on identical code. What is
+  # CHECKED is now the same in every repository. What BLOCKS is yours to move.
+  #
+  # IF THESE FIRE EVERYWHERE
+  #   observe     set this engine to 'observe' for the module in
+  #               .prism/scope.json -- every finding is still reported, none of
+  #               them blocks. This is the right answer to 'this repository has
+  #               a lot of these'.
+  #   baseline    records what exists TODAY; a NEW violation still fails. This
+  #               is strictly better than the switch it replaces, which hid the
+  #               new ones too.
+  #   off         `active: false`, here, one rule at a time. Last resort: the
+  #               rule never comes back, and neither does the check.
+  #   see         'Changing things' in the PRISM documentation folder,
+  #               'The three meanings of off'
+  # ---------------------------------------------------------------------------
+  RouteMustBeSerializable:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  RouteMustBeDataObjectOrDataClass:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  NavGraphBuilderExtensionNaming:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+
+  # ---------------------------------------------------------------------------
+  # TEST-STACK RULES -- 7 rules, always active
+  #
+  # These seven encode ONE test stack: JUnit 5 on the JVM, JUnit 4 for
+  # instrumentation, AssertK for assertions, fakes rather than mocks, no
+  # Robolectric, and no Room on the JVM.
+  #
+  # Against a suite built on mockk, Mockito, Truth, Kotest or Robolectric
+  # they report EVERY TEST FILE IN THE REPOSITORY, and no restructuring
+  # makes the findings go away, because nothing is wrong with the code.
+  # That is a real cost, and it used to be the argument for the switch.
+  #
+  # IT IS NOW THE ARGUMENT AGAINST IT. Baseline them and every existing
+  # test file goes quiet while a NEW file on a second test stack still
+  # fails -- which is the thing you actually wanted to know. The switch
+  # could not do that: it hid the arrival of the second stack as
+  # thoroughly as it hid the first.
+  #
+  # THESE USED TO BE SWITCHABLE. They are not any more, and the reason was
+  # measured: ten installs of one unchanged repository produced four different
+  # rule sets, because an agent read a paragraph like the one above and reached
+  # the opposite conclusion from another agent on identical code. What is
+  # CHECKED is now the same in every repository. What BLOCKS is yours to move.
+  #
+  # IF THESE FIRE EVERYWHERE
+  #   observe     set this engine to 'observe' for the module in
+  #               .prism/scope.json -- every finding is still reported, none of
+  #               them blocks. This is the right answer to 'this repository has
+  #               a lot of these'.
+  #   baseline    records what exists TODAY; a NEW violation still fails. This
+  #               is strictly better than the switch it replaces, which hid the
+  #               new ones too.
+  #   off         `active: false`, here, one rule at a time. Last resort: the
+  #               rule never comes back, and neither does the check.
+  #   see         'Changing things' in the PRISM documentation folder,
+  #               'The three meanings of off'
+  # ---------------------------------------------------------------------------
+  JUnit4InJvmUnitTest:
+    active: true
+    includes: ['**/test/**']
+  JUnit5InInstrumentedTest:
+    active: true
+    includes: ['**/androidTest/**']
+  NonAssertKAssertion:
+    active: true
+    includes: ['**/test/**', '**/androidTest/**']
+  MockingLibraryInTest:
+    active: true
+    includes: ['**/test/**', '**/androidTest/**']
+  RobolectricInTest:
+    active: true
+    includes: ['**/test/**', '**/androidTest/**']
+  JvmComposeTestRule:
+    active: true
+    includes: ['**/test/**', '**/androidTest/**']
+  RoomInJvmUnitTest:
+    active: true
+    includes: ['**/test/**']

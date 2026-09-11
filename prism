@@ -1,0 +1,591 @@
+#!/bin/sh
+# prism — three verbs, and everything else is the framework's business.
+# PRISM is a verification framework; this is its command inside a repository.
+#
+# Lands at the repository root and is COMMITTED.
+#
+# WHY THREE. 0.5.0 shipped 41 invocable things, 17 of them pure reporting, and
+# the first person to install it from the outside said the CLI was "way too
+# complicated ... it would be intuitive to just have a setup command and that's
+# it". He was right about the interface and wrong about the parts: the internals
+# are what the gates and the agent skills call, so they cannot go away. What can
+# go away is any expectation that a HUMAN types them.
+#
+#   status    what blocks, what is suppressed, what coverage says — one screen
+#   promote   the only thing a person does to change what blocks
+#   setup     re-check this install, and repair what is mechanically repairable
+#
+# doctor, guard, report, probe, baseline and version still work, unchanged, with
+# the same arguments. They are simply not the interface any more: `setup` runs
+# the doctor for you, `status` absorbs `report` and the coverage table that used
+# to need `sh .prism/verify/status.sh`, and burning the baseline down is an agent
+# workflow rather than six typed verbs. Nothing was deleted to shrink this list,
+# because a command a gate calls is not a command a person has to know.
+#
+# It cannot weaken anything.
+#   * `promote` promotes, and promotion is always allowed. It is the same word
+#     in both entry points now: `prism-verify enforce` forwards HERE rather than
+#     carrying a second implementation of it.
+#   * there is deliberately no `observe` verb. Seeding happens once, at
+#     install; baseline.py already refuses to regenerate over an existing
+#     baseline, and a shipped one-word command that uninstalls the floor is one
+#     rename away from the escape hatch R7 forbids.
+#   * `status` only reads.
+set -u
+
+PRISM_HOME=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+LIB="$PRISM_HOME/.prism/verify/lib"
+VERIFY="$PRISM_HOME/.prism/verify"
+SCOPE="$PRISM_HOME/.prism/scope.json"
+CONFIG="$PRISM_HOME/.prism/prism.json"
+
+die() { printf 'prism: %s\n' "$1" >&2; shift; for l in "$@"; do printf '  %s\n' "$l" >&2; done; exit 2; }
+[ -d "$LIB" ] || die "no .prism/verify/lib beside this script" \
+    "prism must sit at the repository root, next to .prism/"
+
+usage() {
+    cat <<'USAGE'
+prism — PRISM, a verification framework, in this repository.
+
+  ./prism status              what blocks, what is suppressed, and what the
+                              coverage gate would say right now — for the whole
+                              repository or just the modules you name
+  ./prism baseline            record what the engines find today, so it stops
+                              blocking and a NEW violation of the same rule
+                              still does
+  ./prism coverage            measure coverage and record it — for the whole
+                              repository or just the modules you name
+  ./prism promote :a:module   make one module block: retire its suppressions,
+                              turn on all four engines in it
+  ./prism promote --engine X  make one engine block in every module: detekt,
+                              ktlint, konsist or coverage
+  ./prism promote --all       make the whole repository block, and install the
+                              pre-push floor if it is not there yet
+  ./prism doctor              check this install and repair what it can
+  ./prism probe               re-read your palette and theme names
+
+That is the whole interface. There is no `observe` verb and no way to weaken a
+gate from here — see the header of this file for why.
+
+The internals (guard, report, version) still work and still take the same
+arguments; they are what the gates and your agent's skills call.
+USAGE
+}
+
+posture_recorded() {
+    python3 - "$CONFIG" <<'PY' 2>/dev/null || printf 'unknown\n'
+import json, sys
+try:
+    with open(sys.argv[1]) as handle:
+        print(json.load(handle).get("posture", "unknown"))
+except Exception:
+    print("unknown")
+PY
+}
+
+# --- status ---------------------------------------------------------------
+# One screen, because there were two commands each holding half of it and this
+# file's own help text used to apologise for that: "./prism status shows posture
+# and baselines, not coverage." The coverage half lived at
+# `sh .prism/verify/status.sh`, which nothing pointed at from here.
+
+report_suppressed() {
+    printf 'SUPPRESSED — what was already here when PRISM arrived\n\n'
+    # ONE BASELINE PER MODULE since 0.6.0, so this asks about the tree. The old
+    # single root file could not tell two modules apart: an id carries the bare
+    # filename, so a `RunningTracker.kt` in two modules was ONE entry, and
+    # promoting either left it suppressing the other's finding.
+    #
+    # NOT the raw `count` line either. It used to read `current=330 suppressed=0`,
+    # which are detekt's two XML tag names printed as if they were English: those
+    # 330 ARE the suppressed ones (<CurrentIssues>) and the 0 is the hand-written
+    # block (<ManuallySuppressedIssues>). A reader saw "suppressed=0" next to 330
+    # and concluded that nothing was suppressed and 330 findings were live — the
+    # exact inverse of the truth, on the one number a promotion decision turns on.
+    counts=$(python3 "$LIB/baseline.py" count --root "$PRISM_HOME" 2>/dev/null)
+    counts_status=$?
+    total=$(printf '%s' "$counts" | sed -n 's/^suppressed=\([0-9]*\).*/\1/p')
+    manual=$(printf '%s' "$counts" | sed -n 's/.*manual=\([0-9]*\).*/\1/p')
+    stale=$(printf '%s' "$counts" | sed -n 's/.*stale=\([0-9]*\).*/\1/p' | head -1)
+    if [ -z "$total" ] && [ "$counts_status" != "3" ]; then
+        printf '  detekt   a detekt.baseline.xml does not parse — detekt fails every\n'
+        printf '           module on an invalid baseline. Fix or delete it.\n'
+    elif [ "${total:-0}" = "0" ]; then
+        printf '  detekt   nothing suppressed — every finding blocks where detekt enforces\n'
+    else
+        printf '  detekt   %s findings suppressed, so they do not block\n' "$total"
+        [ "${manual:-0}" = "0" ] || \
+            printf '           (%s of them added by hand, not by the install)\n' "$manual"
+        # Per module, because that is what the files are now. Read from the
+        # lines before the first blank one: what follows that is the stale-entry
+        # detail, which gets its own sentence below rather than being spliced in.
+        printf '%s\n' "$counts" \
+            | awk 'NR > 1 { if ($0 == "") exit; printf "           %-32s %s\n", $1, $2 }'
+        [ "${stale:-0}" = "0" ] || {
+            printf '           %s baselined file name(s) are no longer in their module, so\n' "$stale"
+            printf '           those findings block again — an id names a FILE, so renaming\n'
+            printf '           one detaches its entries. Which ones:\n'
+            printf '             python3 .prism/verify/lib/baseline.py count\n'
+        }
+    fi
+    # PRISM'S OWN TWO MODULES ARE NOT ON THIS SCREEN, and the other two tables
+    # already knew that: scope.py filters them out of the posture table and
+    # affected.sh out of the coverage table. This listing walked the tree with
+    # `find` instead, so one screen excluded them twice and included them once --
+    # measured on an acceptance install, where `tooling/prism-rules  0 entries`
+    # and `tooling/konsist  0 entries` sat above the consumer's only real module.
+    # Empty files, so nothing was hidden; but a consumer reading a report of what
+    # THEIR repository suppresses should not have to know which two directories
+    # are the framework's.
+    #
+    # The list comes from affected.sh rather than a third copy of the paths. That
+    # file's own header records a definition kept in two places drifting apart
+    # twice in one branch, and tests/test_affected.sh exists to hold the two it
+    # already has together.
+    kt_own=$( PRISM_ROOT="$PRISM_HOME" . "$LIB/affected.sh" >/dev/null 2>&1
+              prism_own_modules | sed 's|^:||; s|:|/|g' )
+    kt_files=$(find "$PRISM_HOME" -name ktlint.baseline.xml -not -path '*/build/*' 2>/dev/null \
+        | while read -r f; do
+              rel=$(dirname "${f#"$PRISM_HOME"/}")
+              printf '%s\n' "$rel" | grep -qxF "$kt_own" || printf '%s\n' "$f"
+          done)
+    kt=$(printf '%s' "$kt_files" | grep -c . )
+    if [ "$kt" = "0" ]; then
+        printf '  ktlint   no baseline — every violation blocks where ktlint enforces\n'
+    else
+        printf '  ktlint   %s module baseline(s):\n' "$kt"
+        printf '%s\n' "$kt_files" \
+            | while read -r f; do
+                [ -n "$f" ] || continue
+                # grep -o, not grep -c: ktlint writes the whole baseline on
+                # one line, and a LINE count reports 1 for any number of files.
+                printf '           %-46s %s entries\n' \
+                    "$(dirname "${f#"$PRISM_HOME"/}")" \
+                    "$(grep -o '<file ' "$f" 2>/dev/null | wc -l | tr -d ' ')"
+            done
+    fi
+    printf '\n  A suppressed finding does not block. A NEW violation of the same rule\n'
+    printf '  still does — that is the whole difference between a baseline and\n'
+    printf '  switching a rule off.\n'
+}
+
+cmd_status() {
+    printf 'POSTURE — what blocks, per module\n\n'
+    python3 "$LIB/scope.py" show --root "$PRISM_HOME" || exit 2
+    printf '\n'
+    report_suppressed
+    printf '\nCOVERAGE — what the coverage gate would say right now\n\n'
+    # The same script the guide used to name directly. It runs no Gradle task
+    # and reads recorded XML, so this stays a read-only command; on a large
+    # repository it is the slow half, and naming modules limits it.
+    if [ -f "$VERIFY/status.sh" ]; then
+        sh "$VERIFY/status.sh" "$@" || true
+    else
+        printf '  no .prism/verify/status.sh — this install is incomplete.\n'
+        printf '  Run ./prism setup.\n'
+    fi
+    printf '\nWHERE THE REPORTS ARE\n\n'
+    cat <<'REPORTS'
+  detekt    <module>/build/reports/detekt/detekt.{html,xml,sarif}
+            read the XML when a gate denied; the HTML is for humans
+  konsist   tooling/konsist/build/reports/tests/test/index.html
+  ktlint    stdout only — it writes no file
+  coverage  JaCoCo XML per module, under build/reports/prism-coverage/
+            or prism-combined-coverage/ — the verdict is the table above
+REPORTS
+}
+
+# --- promote --------------------------------------------------------------
+
+promote_module() {
+    module=$1
+    case "$module" in :*) ;; *) die "module must be a Gradle path, e.g. :feature:login" ;; esac
+    [ -f "$SCOPE" ] || die "there is no .prism/scope.json" \
+        "This install already enforces everywhere; there is nothing to promote."
+
+    # Suppressions first, posture second. The other order leaves a window in
+    # which the module blocks on findings that were always going to be dropped.
+    # Its output is NOT discarded. Sending stderr to /dev/null here is what hid
+    # a drop that retired nothing behind a message reading like success; what
+    # this command could not retire is exactly what the promoter needs to hear.
+    # EXACT since 0.6.0: the module's own baseline file, not an inference from a
+    # bare filename. This is the call that used to refuse when a sibling module
+    # held a file of the same name -- rightly, because guessing would have been
+    # worse -- and the entries it kept were suppressing real findings in the
+    # module being promoted.
+    python3 "$LIB/baseline.py" drop --module "$module" --root "$PRISM_HOME" || true
+    ktb="$PRISM_HOME/$(printf '%s' "$module" | sed 's/^://; s/:/\//g')/ktlint.baseline.xml"
+    [ -f "$ktb" ] && rm -f "$ktb" && printf 'Removed %s\n' "${ktb#"$PRISM_HOME"/}"
+    # Both engines now keep one baseline per module, which is why these two lines
+    # finally look the same.
+
+    python3 - "$SCOPE" "$module" <<'PY' || exit 2
+import json, sys
+path, module = sys.argv[1], sys.argv[2]
+with open(path) as handle:
+    data = json.load(handle)
+data.setdefault("modules", {})[module] = {
+    "detekt": "enforce", "ktlint": "enforce",
+    "konsist": "enforce", "coverage": "enforce",
+}
+with open(path, "w") as handle:
+    json.dump(data, handle, indent=2)
+    handle.write("\n")
+print("%s now enforces every engine." % module)
+PY
+    # NOT `git checkout .prism/scope.json`. Straight after an install the file
+    # is untracked, so that command fails with "did not match any file(s) known
+    # to git" -- shipped advice that does not work in the state it is most
+    # likely to be read in.
+    printf '\nRun ./gradlew staticAnalysis. If it is red, the findings were real.\n'
+    printf 'To step back, set those engines to "observe" in .prism/scope.json\n'
+    printf '(or `git checkout .prism/scope.json`, once it has been committed).\n'
+}
+
+# The other axis. A module moves all four engines at once; an engine moves every
+# module at once. Both only ever strengthen, which is why neither violates the
+# no-weakening rule in this file's header.
+#
+# It exists because the greenfield path ends here and had no verb for it. A new
+# project installs with konsist and coverage observing -- konsist because a JUnit
+# suite has no baseline to record into, coverage because nothing has measured it
+# yet -- and finishing the install means promoting exactly those two, repository
+# wide. Until 0.6.2 the shipped guide told a human to type
+#
+#     python3 .prism/verify/lib/scope.py set --default --engine konsist --posture enforce
+#
+# which is a library path, an internal flag vocabulary, and four words of JSON
+# schema, to do the last step of a normal install.
+promote_engine() {
+    engine=$1
+    case "$engine" in
+        detekt|ktlint|konsist|coverage) ;;
+        *) die "\"$engine\" is not a PRISM engine" \
+               "One of: detekt ktlint konsist coverage" ;;
+    esac
+    [ -f "$SCOPE" ] || die "there is no .prism/scope.json" \
+        "This install already enforces everywhere; there is nothing to promote."
+
+    # scope.py owns the write: atomic, $comment preserved, and it reports
+    # PLACED / UPDATED / UNCHANGED rather than guessing which happened.
+    python3 "$LIB/scope.py" set --default --engine "$engine" --posture enforce \
+        --root "$PRISM_HOME" || exit 2
+
+    printf '\nRun ./gradlew staticAnalysis. If it is red, the findings were real.\n'
+    printf 'To step back, set %s to "observe" in .prism/scope.json.\n' "$engine"
+}
+
+# THE TWO STEPS CANNOT BE COLLAPSED, ONLY WRAPPED. detekt's own creation task
+# REPLACES the file it is pointed at rather than merging into it, and a module
+# runs two or three of them (`detekt` for test sources, `detektMain` or
+# `detektDebug` for the resolution-backed rules). So each writes a per-task
+# fragment under build/prism/baseline/, and baseline.py unions them per module.
+# Run the union first and there is nothing to union: it dies with "no baseline
+# fragments under .".
+#
+# Until 0.6.3 this was a bare passthrough that ran no Gradle at all, so the
+# shipped documents had to spell both halves -- and, unlike `probe` and `guard`
+# beside it, it did not inject --root, so `./prism baseline count` silently
+# depended on the caller's working directory.
+#
+# ktlint needs no union: prismKtlintBaseline writes each module's final file
+# directly, and one `./gradlew prismBaseline` run has already finished it.
+cmd_baseline() {
+    case "${1:-}" in
+        '')
+            printf 'Recording what every engine finds today.\n\n'
+            ( cd "$PRISM_HOME" && ./gradlew prismBaseline ) \
+                || die "./gradlew prismBaseline failed" \
+                       "Nothing was recorded. Fix the build first."
+            printf '\n'
+            python3 "$LIB/baseline.py" collect --root "$PRISM_HOME" || exit 2
+            printf '\nRun ./gradlew staticAnalysis. It should now be green: these\n'
+            printf 'findings are recorded, and a NEW violation of the same rule\n'
+            printf 'still fails the build.\n'
+            ;;
+        --force|*--force*)
+            # REACHABLE, NEVER AUTOMATIC. Regenerating over an existing baseline
+            # absorbs every violation written since the last one, permanently,
+            # and nothing reports that it happened. baseline.py refuses without
+            # this flag; that refusal is the feature.
+            die "--force is not something this command passes for you" \
+                "Regenerating a baseline ABSORBS every violation written since the" \
+                "last one. To retire entries as you fix them:" \
+                "  ./prism baseline drop --rule <RuleId>" \
+                "If you really mean to discard the record, call the library directly."
+            ;;
+        *)
+            python3 "$LIB/baseline.py" "$@" --root "$PRISM_HOME"
+            ;;
+    esac
+}
+
+# MEASURE, THEN RECORD -- and derive every argument rather than making anybody
+# type them. Until 0.6.3 the shipped documents asked for this:
+#
+#   python3 .prism/verify/lib/coverage.py record \
+#     --module :app --root . --kind jvm \
+#     --xml app/build/reports/prism-coverage/coverage.xml
+#
+# Every one of those four values is derivable from the module name, and the
+# commands themselves already exist in ONE renderer: affected.sh's
+# prism_refresh_commands, which is what `./prism status` prints and what the
+# push gate prints when it denies. A second copy here is exactly the failure
+# mode affected.sh warns about, so this sources that file rather than re-spelling
+# anything.
+#
+# WHY NO HOOK MAY CALL THIS. push-verify.sh keeps deciding and performing apart
+# on purpose: a timed-out hook does NOT block, so the gate reads artifacts in
+# milliseconds and a human produces them with no timeout overhead. This is the
+# performing half.
+#
+# It cannot launder a number. coverage.py record refuses unless the timestamps
+# already say the report matches the source on disk.
+cmd_coverage() {
+    modules=$*
+    [ -n "$modules" ] || modules=$(
+        PRISM_ROOT="$PRISM_HOME" . "$LIB/affected.sh" >/dev/null 2>&1
+        prism_all_modules 2>/dev/null
+    )
+    [ -n "$modules" ] || die "no modules found" \
+        "Is this the repository root, and does settings.gradle.kts list modules?"
+
+    needs_device=""
+    for module in $modules; do
+        kind=$(python3 "$LIB/coverage.py" check --module "$module" --root "$PRISM_HOME" 2>/dev/null)
+        case "$kind" in
+            jvm) ;;
+            combined|instrumentation)
+                needs_device="$needs_device $module"
+                printf '  %-34s %-12s needs a connected run\n' "$module" "$kind"
+                continue
+                ;;
+            *)
+                printf '  %-34s %-12s nothing to measure\n' "$module" "${kind:-unknown}"
+                continue
+                ;;
+        esac
+
+        printf '  %-34s %-12s measuring…\n' "$module" "$kind"
+        ( cd "$PRISM_HOME" && ./gradlew \
+            --init-script "$PRISM_HOME/.prism/assets/prism-coverage.init.gradle.kts" \
+            "$module:prismCoverage" ) || {
+                printf '  %-34s FAILED — the tests did not pass\n' "$module"
+                continue
+            }
+        xml=$(
+            PRISM_ROOT="$PRISM_HOME" . "$LIB/affected.sh" >/dev/null 2>&1
+            prism_coverage_xml_for "$module" "$kind"
+        )
+        result=$(python3 "$LIB/coverage.py" record --module "$module" \
+            --root "$PRISM_HOME" --kind "$kind" --xml "$xml" 2>&1)
+        printf '  %-34s %s\n' "$module" "$result"
+    done
+
+    # PRISM DOES NOT BOOT EMULATORS. Starting a virtual machine on somebody's
+    # computer is not something a verification command should decide to do, and
+    # a wrong AVD is slow to notice. It uses one that is already running and
+    # otherwise says what to type.
+    if [ -n "$needs_device" ]; then
+        printf '\nThese modules have an instrumented suite, so they need a device:\n'
+        printf '   %s\n' "$needs_device"
+        serial=$(python3 "$PRISM_HOME/.prism/assets/select_emulator.py" --min-sdk 26 2>/dev/null)
+        case "$serial" in
+            running\ *)
+                printf '\nAn emulator is running (%s). Re-run with it:\n' "${serial#running }"
+                printf '   ANDROID_SERIAL=%s ./prism coverage%s\n' \
+                    "${serial#running }" "$needs_device"
+                ;;
+            boot\ *)
+                printf '\nNo emulator is running. Start one, then run this again:\n'
+                printf '   android emulator start %s\n' "${serial#boot }"
+                ;;
+            *)
+                printf '\nNo compatible emulator was found (minSdk 26).\n'
+                printf '`./prism status` prints the full commands for these modules.\n'
+                ;;
+        esac
+    fi
+}
+
+promote_all() {
+    # THE ORDER IS THE WHOLE THING, and it is the order `prism-verify enforce`
+    # established: the floor first and its failure stops everything, the scope
+    # file next because that is what actually enforces, and the record LAST so
+    # an aborted promotion leaves the record HONEST. A posture flipped to
+    # "enforce" over a repository with no floor -- or one that still has a scope
+    # file full of `observe` -- is worse than the observing install it replaced,
+    # because the doctor then reports a correctly-installed tree as broken and
+    # the person reading it cannot tell which half is wrong.
+    installer="$PRISM_HOME/.prism/adapters/git/install.sh"
+    [ -f "$installer" ] || die "no .prism/adapters/git/install.sh" \
+        "The pre-push floor cannot be installed, so the posture is left alone." \
+        "This install is incomplete; re-run the setup command."
+    if ! sh "$installer" "$PRISM_HOME"; then
+        die "the floor was not installed, so the recorded posture is unchanged" \
+            "An install that half-succeeded would leave the doctor reporting a" \
+            "gap that the record says should not exist."
+    fi
+
+    if [ -f "$SCOPE" ]; then
+        rm -f "$SCOPE" || die "the floor is installed, but $SCOPE could not be removed" \
+            "That file is what decides whether anything blocks, so the recorded" \
+            "posture is left alone rather than made untrue." \
+            "Remove it by hand and commit: rm .prism/scope.json"
+        printf 'Removed   .prism/scope.json — every engine now enforces in every module\n'
+    else
+        printf 'No        .prism/scope.json — every engine already enforces everywhere\n'
+    fi
+
+    was=$(posture_recorded)
+    python3 - "$CONFIG" <<'PY' || die "the floor is installed, but .prism/prism.json could not be rewritten" \
+        "Set \"posture\": \"enforce\" by hand."
+import json, sys
+path = sys.argv[1]
+with open(path) as handle:
+    config = json.load(handle)
+config["posture"] = "enforce"
+with open(path, "w") as handle:
+    json.dump(config, handle, indent=2)
+    handle.write("\n")
+PY
+    printf 'Recorded  posture: %s -> enforce\n' "$was"
+
+    # Promoting does NOT clear the baseline, and saying so here is the point:
+    # somebody who reads "enforce" as "everything is checked now" would be wrong
+    # about however many findings are still suppressed.
+    if [ -n "$(find "$PRISM_HOME" -name detekt.baseline.xml -not -path '*/build/*' \
+            -not -path '*/.git/*' 2>/dev/null | head -1)" ]; then
+        printf '\n'
+        report_suppressed
+        printf '\nPromoting does not retire them. Ask your agent for the burndown\n'
+        printf 'workflow, which groups them by rule and fixes the worst first.\n'
+    fi
+
+    # The verdict is not this command's to give.
+    printf '\n'
+    sh "$VERIFY/prism-doctor"
+}
+
+cmd_promote() {
+    case "${1:-}" in
+        '')
+            die "promote needs to know what to promote" \
+                "./prism promote :a:module   one module: retire its suppressions," \
+                "                            turn on all four engines in it" \
+                "./prism promote --engine X  one engine, in every module" \
+                "./prism promote --all       the whole repository, plus the pre-push floor" \
+                "" \
+                "Promoting everything is not something you should reach by a typo," \
+                "which is why there is no bare form."
+            ;;
+        --all)
+            [ $# -eq 1 ] || die "promote --all takes no other arguments (got \"$2\")"
+            promote_all
+            ;;
+        --engine)
+            [ $# -eq 2 ] || die "promote --engine takes one engine name" \
+                "One of: detekt ktlint konsist coverage"
+            promote_engine "$2"
+            ;;
+        -*) die "unknown option \"$1\"" "Did you mean --engine, or --all?" ;;
+        *)
+            [ $# -eq 1 ] || die "promote takes one module (got \"$2\" as well)" \
+                "Promote them one at a time; each one needs its own green build."
+            promote_module "$1"
+            ;;
+    esac
+}
+
+# --- setup ----------------------------------------------------------------
+# The verb a person reaches for when something looks wrong. It repairs what is
+# mechanically repairable, then hands the verdict to the doctor -- which is the
+# whole reason `doctor` no longer needs to be in anybody's head.
+#
+# WHAT IT WILL NOT DO: install the floor over a repository whose record says
+# `observe`. Declining the floor is a supported choice, and a "repair" that
+# quietly installs enforcement somebody said no to is not a repair.
+
+cmd_doctor() {
+    [ $# -eq 0 ] || die "doctor takes no arguments (got \"$1\")" \
+        "To install into a repository that has no .prism/ yet, run the" \
+        "installer instead:  ./prism-verify"
+    printf 'REPAIR — what could be fixed without asking\n\n'
+    repaired=0
+
+    hooks_dir=$(git -C "$PRISM_HOME" rev-parse --git-path hooks 2>/dev/null) || hooks_dir=''
+    case "$hooks_dir" in
+        '') hooks_dir="$PRISM_HOME/.git/hooks" ;;
+        /*) ;;
+        *) hooks_dir="$PRISM_HOME/$hooks_dir" ;;
+    esac
+    hook="$hooks_dir/pre-push"
+    posture=$(posture_recorded)
+
+    if [ -f "$hook" ] && [ ! -x "$hook" ]; then
+        # git skips a non-executable hook silently: no warning, no output, exit
+        # 0. This is the one repair that fixes an install which looks wired and
+        # enforces nothing, so it runs under either posture.
+        if chmod +x "$hook"; then
+            printf '  FIXED     chmod +x %s\n' "${hook#"$PRISM_HOME"/}"
+            printf '            git skips a non-executable hook without saying so.\n'
+            repaired=$((repaired + 1))
+        else
+            printf '  COULD NOT chmod +x %s\n' "$hook"
+        fi
+    elif [ ! -f "$hook" ] && [ "$posture" = "enforce" ]; then
+        printf '  MISSING   the pre-push floor, and the record says this repository\n'
+        printf '            enforces. Reinstalling it:\n'
+        if sh "$PRISM_HOME/.prism/adapters/git/install.sh" "$PRISM_HOME"; then
+            repaired=$((repaired + 1))
+        else
+            printf '  COULD NOT install the floor. The reason is above.\n'
+        fi
+    fi
+
+    [ "$repaired" = "0" ] && printf '  nothing to repair\n'
+
+    printf '\nVERDICT — from prism-doctor, which decides this rather than repairs it\n\n'
+    sh "$VERIFY/prism-doctor" "$@"
+}
+
+command=${1:-status}
+[ $# -gt 0 ] && shift
+case "$command" in
+    status)   cmd_status "$@" ;;
+    baseline) cmd_baseline "$@" ;;
+    coverage) cmd_coverage "$@" ;;
+    promote)  cmd_promote "$@" ;;
+    doctor)   cmd_doctor "$@" ;;
+    probe)    python3 "$LIB/probe.py" --root "$PRISM_HOME" "$@" ;;
+    # `setup` was this verb's name until 0.6.2, when the installer began
+    # removing itself: with no ./prism-verify left in the repository, "setup"
+    # could only ever mean "check this install", which is what it always did.
+    # Accepted, never advertised -- the same treatment `enforce` gets below.
+    setup)
+        printf 'prism: `setup` is `doctor` now — the installer removes itself when it\n' >&2
+        printf '       finishes, so this verb only ever checked and repaired. Running it.\n\n' >&2
+        cmd_doctor "$@"
+        ;;
+    # `enforce` was this file's name for promote until 0.6.0, while
+    # `prism-verify enforce` meant something wider. One word, two actions, and
+    # the doctor recommended the other one by name. Accepted, never advertised.
+    enforce)
+        printf 'prism: `enforce` is `promote` now — one word for one action, in both\n' >&2
+        printf '       entry points. Running `promote` for you.\n\n' >&2
+        case "${1:-}" in
+            '') cmd_promote --all ;;
+            *)  cmd_promote "$@" ;;
+        esac
+        ;;
+    # Internals. Still here, still working, still what the gates and skills
+    # call. Absent from `usage` on purpose: see the header.
+    report)   cmd_status "$@" ;;
+    guard)    base=$(python3 -c "import json;print(json.load(open('$PRISM_HOME/.prism/prism.json'))['baseBranch'])" 2>/dev/null) || die "no baseBranch in .prism/prism.json"
+              python3 "$LIB/guard.py" --root "$PRISM_HOME" --base "$base" \
+                  && printf 'Nothing weakened relative to %s.\n' "$base" ;;
+
+    version)  cat "$PRISM_HOME/.prism/VERSION" 2>/dev/null || die "no .prism/VERSION" ;;
+    -h|--help|help) usage ;;
+    *)        usage; exit 2 ;;
+esac

@@ -1,0 +1,54 @@
+// Forces detekt to emit a report prism-doctor can read — applied at runtime via
+// `--init-script`, never written into the consumer's build files.
+//
+// GROOVY, not Kotlin, and that is the whole reason this file exists in this
+// form. An init script is compiled against Gradle's *initialisation* classpath,
+// which carries no project plugin. A Kotlin init script naming
+// `dev.detekt.gradle.Detekt` therefore fails to COMPILE — "Unresolved reference
+// 'dev'" — before a single task runs, and the doctor reports UNDETERMINED on a
+// perfectly wired install. Groovy resolves the task's properties dynamically,
+// against the real object at execution time, so the type never has to be on
+// this script's classpath. The task is matched by class NAME for the same
+// reason (`_Decorated` suffix included, hence startsWith).
+//
+// Two things this exists to defeat, and both are false-green hazards:
+//
+//   THE EXIT CODE LIES. detekt 2.0 defaults to `ignoreFailures = false` and
+//   `failOnSeverity = Error`, so a finding FAILS the task. The canary run is
+//   supposed to produce a finding, which means a CORRECT install exits
+//   non-zero and a broken one exits zero. A doctor reading the exit status
+//   would report the exact opposite of the truth. `ignoreFailures = true`
+//   below removes the exit code from the question entirely: the verdict comes
+//   from the report, and a non-zero exit then means Gradle itself broke.
+//
+//   THE STALE REPORT. detekt's default output location is
+//   `<module>/build/reports/detekt/<taskName>.xml`, which a previous run may
+//   already have written. Reading that file proves nothing about THIS run. The
+//   report is redirected to a fresh path outside `build/`, supplied per run by
+//   the caller, so there is never a prior file at that path to misread.
+//
+// The report type is `checkstyle`. detekt 2.0 renamed it: `DetektReports`
+// exposes checkstyle/html/sarif/markdown and has no `xml` member at all, so
+// `reports.xml { }` names nothing in this version.
+
+def reportPath = System.getProperty('prism.doctor.report')
+if (reportPath == null) {
+    throw new GradleException(
+        'prism-doctor-canary.init.gradle: -Dprism.doctor.report was not set. ' +
+            'Without it the canary would read detekt\'s default report, which a ' +
+            'previous run may have written — proving nothing about this one.')
+}
+
+allprojects { project ->
+    project.tasks.configureEach { task ->
+        if (!task.getClass().name.startsWith('dev.detekt.gradle.Detekt')) {
+            return
+        }
+        // The verdict is the report's contents, never this task's exit status.
+        task.ignoreFailures.set(true)
+        task.reports.checkstyle { report ->
+            report.required.set(true)
+            report.outputLocation.set(new File(reportPath))
+        }
+    }
+}

@@ -53,6 +53,9 @@ dependencies {
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.jupiter.engine)
     testImplementation(libs.assertk.jvm)
+    // Gradle needs the launcher on the test runtime classpath to start the
+    // JUnit Platform at all: without it the run fails before any test does.
+    testRuntimeOnly(libs.junit.platform.launcher)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)

@@ -251,6 +251,51 @@ tp_run "$tpc" coverage :core:domain
 assert_eq "0" "$TP_CODE" "coverage runs"
 assert_contains "$TP_OUT" ":core:domain" "and names the module it looked at"
 
+# NO SOURCING OF affected.sh MAY USE THE ASSIGNMENT-PREFIX FORM. On macOS
+# /bin/sh is bash 3.2 in POSIX mode, where `VAR=x . file` inside a function
+# loses VAR after the builtin returns -- reproduced directly:
+#
+#   f() { V=1 . /dev/null; echo "${V-UNSET}"; }   -> UNSET
+#   f() { V=1 : ;          echo "${V-UNSET}"; }   -> 1
+#
+# It is specific to `.`, and it is STRICTLY WORSE than writing no prefix at all,
+# because affected.sh's own `PRISM_ROOT="${PRISM_ROOT:-$(git rev-parse ...)}"`
+# fallback would have covered the bare case. The prefix defeats its own safety
+# net. Three sites carried this shape; one of them shipped broken.
+tp_src=$(cat "$TP_PRISM")
+assert_not_contains "$tp_src" 'PRISM_ROOT="$PRISM_HOME" . ' \
+    "no sourcing of affected.sh uses the assignment-prefix form"
+
+# AND THE REASON MUST REACH THE READER. `2>/dev/null` on prism_all_modules turned
+# "PRISM_ROOT: unbound variable" into "no modules found -- is this the repository
+# root?", which blames the consumer's settings.gradle.kts for a bug in ours.
+assert_not_contains "$tp_src" 'prism_all_modules 2>/dev/null' \
+    "the module listing does not swallow the reason it failed"
+
+# WITH NO ARGUMENT IT MUST FIND THE MODULES ITSELF. This failed on a real
+# install with "no modules found": `VAR=x . file` does not reliably carry VAR
+# into the sourced file under /bin/sh on macOS, and prism_all_modules reads
+# PRISM_ROOT. The pattern had been in this file since 0.6.0 and got away with it
+# only because the function it borrowed, prism_own_modules, prints two literals
+# and never reads the variable.
+tp_run "$tpc" coverage
+assert_not_contains "$TP_OUT" "no modules found" \
+    "bare ./prism coverage resolves the module list"
+assert_contains "$TP_OUT" ":core:" "and names the modules it found"
+
+# THE CONNECTED RUN GOES THROUGH THE LOCK OR NOT AT ALL. Two connected runs of
+# the same test package on one emulator kill each other -- measured on
+# :feature:files:presentation, where the killed run could not pull back its .ec
+# and coverage then read `no-device-run`, which looks exactly like "you never
+# ran it". Until 0.6.3 the lock was something status.sh PRINTED and a human was
+# trusted to paste; now the verb runs it.
+assert_contains "$(cat "$TP_PRISM")" 'device_lock.py' \
+    "./prism coverage routes the connected run through the device lock"
+assert_contains "$(cat "$TP_PRISM")" 'select_emulator.py' \
+    "and finds a running emulator rather than booting one"
+assert_not_contains "$(cat "$TP_PRISM")" 'android emulator start "' \
+    "PRISM never starts a virtual machine on somebody's computer"
+
 # A module with no test sources has nothing to measure, and says so rather
 # than failing.
 tp_run "$tpc" coverage :nope:nothing

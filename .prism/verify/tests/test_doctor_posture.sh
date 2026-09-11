@@ -141,8 +141,8 @@ dp_baseline "$dp6" "RuleA:a.kt\$x" "RuleA:b.kt\$y" "RuleB:c.kt\$z"
 dp6_out=$(dp_run "$dp6")
 assert_contains "$dp6_out" "3 findings suppressed" \
     "the doctor counts what the baseline still holds"
-assert_contains "$dp6_out" "baseline.py group" \
-    "and points at the breakdown by rule"
+assert_contains "$dp6_out" "./prism baseline group" \
+    "and points at the breakdown by rule, as a verb rather than a library path"
 
 # --- empty is the signal to enforce --------------------------------------
 dp7=$(dp_repo)

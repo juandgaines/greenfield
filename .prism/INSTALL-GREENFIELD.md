@@ -10,10 +10,32 @@ right is the word "nothing".
 
 ---
 
-## A generated project is not a clean project
+## Which kind of new project you have
 
-`android create` produces a working Compose app. Measured against PRISM's rule
-set, that app arrives with **17 findings before you write a line**:
+There are two ways to make one, and **they are not the same project**. Which you
+used changes the numbers below, which engines block on day one, and whether one
+whole section of this document applies to you at all.
+
+| | `android create` (the CLI) | Android Studio's New Project |
+|---|---|---|
+| what it generates | `MainActivity`, `Navigation`, a `MainScreen` composable, a `MainScreenViewModel`, a `DataRepository` | `MainActivity` with a `Greeting` composable, and nothing else |
+| a ViewModel? | **yes** | **no — none at all** |
+| detekt findings | **15** | **6** |
+| ktlint findings | **1** | **2**, both `no-wildcard-imports` |
+| konsist | **1 failure** — so it starts `observe` | **0 failures** — so it starts `enforce` |
+| observing after install | konsist **and** coverage | **coverage only** |
+
+The worked example below is the CLI one, because it is the harder of the two:
+everything the Studio shape needs is a subset. Where they diverge, it is called
+out.
+
+**Both** produce a `src/test/` and a `src/androidTest/`, which matters later —
+see the coverage step.
+
+### The CLI project, in detail
+
+Measured against PRISM's rule set, `android create` output arrives with
+**17 findings before you write a line**:
 
 | | count |
 |---|---|
@@ -28,8 +50,25 @@ set, that app arrives with **17 findings before you write a line**:
 | ktlint, not auto-correctable | 1 |
 | konsist — `Screen composables take no ViewModel()` | 1 |
 
-Nothing is wrong with the template and nothing is wrong with the rules. They are
-two different opinions about Kotlin meeting each other for the first time.
+### The Studio project, in detail
+
+Fewer, because there is less code — no ViewModel, no navigation, no repository:
+
+| | count |
+|---|---|
+| `JUnit4InJvmUnitTest` | 2 |
+| `NonAssertKAssertion` | 2 |
+| `ClassBodyMissingLeadingBlankLine` | 1 |
+| `PreviewMustBePrivate` | 1 — on `GreetingPreview` |
+| ktlint `no-wildcard-imports` | 2 |
+
+Every one of them is in scaffolding Studio wrote, and **konsist passes
+outright** — 15 of its 23 assertions have nothing to match on, so they are
+skipped rather than failed. That is why a Studio project starts with **three**
+engines enforcing rather than two.
+
+Nothing is wrong with either template and nothing is wrong with the rules. They
+are two different opinions about Kotlin meeting each other for the first time.
 
 Two of those you cannot fix by editing the generated code:
 `KoinViewModelOnlyInRoot` wants Koin and `NonAssertKAssertion` wants assertK, and
@@ -64,6 +103,10 @@ pretending, and `.prism/scope.json` names exactly those two:
 **An engine this file does not name enforces.** That is why the file is short
 and why the shortest file is the strictest one.
 
+So you never *add* a line to make something block — you **delete** the line that
+stops it. Writing `"konsist": "enforce"` is a no-op, and it makes the file
+longer without making it stricter.
+
 ---
 
 ## The whole sequence, start to finish
@@ -81,10 +124,17 @@ Three and six are the ones people get wrong, and both are called out below.
 
 ### Create the project
 
+Either way works, and the table at the top says how they differ:
+
 ```sh
 android create --name="My App" empty-activity
 cd MyApp
 ```
+
+or **File → New Project → Empty Activity** in Android Studio, which is what most
+people do. Studio also writes a `.gitignore`; `android create` does not, so on
+the CLI path add one before your first commit or `git add -A` will commit
+`local.properties`.
 
 ### Raise Kotlin to 2.4
 
@@ -266,7 +316,14 @@ posture back does not restore them. Only git does.
 
 ### konsist — one refactor, and one decision it forces
 
-The generated `MainScreen` takes the ViewModel directly. PRISM's MVI contract
+> **Skip this whole section if you used Android Studio.** It generates no
+> ViewModel and no `Screen` composable, so konsist has nothing to match on: it
+> passes at install and is already `enforce`. Measured on a real Studio project:
+> 0 failures, 15 of 23 assertions skipped. `./prism status` will show konsist
+> already enforcing, and there is nothing here for you to do. Go to
+> [coverage](#coverage--one-measurement).
+
+The CLI-generated `MainScreen` takes the ViewModel directly. PRISM's MVI contract
 wants a stateless `Screen` with a `Root` above it that owns the ViewModel, so
 the screen can be previewed and tested on its own.
 
@@ -339,10 +396,39 @@ Take the measurement, then promote:
 ./prism promote --engine coverage
 ```
 
-`./prism coverage` runs the suite, produces the report and records it against
-the source it measured. A module with an instrumented suite needs a booted
-emulator; the command says so and prints what to start rather than starting it
-for you.
+`./prism coverage` runs the suite, produces the report, records it against the
+source it measured, and prints the number:
+
+```
+  :app                           combined    unit + instrumented, on emulator-5554
+                                 14.3% of lines covered, floor 80 — reported, not blocking
+```
+
+**Expect to need an emulator, and know why.** Both generators ship a
+`src/androidTest/` as well as a `src/test/`, and a module with both is measured
+as *combined* — unit and instrumented together. An empty `androidTest`
+directory is enough to make it so. That means a brand-new project needs a booted
+device before it can produce any coverage number at all, which surprises people
+who have not written an instrumented test yet.
+
+`./prism coverage` uses an emulator that is already running. If none is, it says
+which to start and stops — **it never boots a virtual machine on your machine.**
+
+Two honest ways forward, and the second is often right on a new project:
+
+```sh
+android emulator start <avd>      # then run ./prism coverage again
+```
+
+or delete the source set you are not going to use:
+
+```sh
+rm -r app/src/androidTest
+```
+
+That makes the module unit-test-only, and it measures with no device at all. Do
+it only if you mean it — adding instrumented tests later is fine, and coverage
+simply goes back to needing a device when you do.
 
 A floor below 80 is a legitimate starting ramp — set it in
 `.prism/verify/thresholds.json` to a number you have **already measured**, and

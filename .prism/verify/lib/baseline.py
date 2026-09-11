@@ -237,7 +237,7 @@ def cmd_collect(args):
                   "last one -- the findings you were about to be told about become",
                   "permanently suppressed, and nothing reports that it happened. To",
                   "retire entries as you fix them, use:",
-                  "  baseline.py drop --rule <RuleId>",
+                  "  ./prism baseline drop --rule <RuleId>",
                   "Pass --force only if you mean to discard the existing record.",
               ])
         )
@@ -552,7 +552,7 @@ def drop_rule(args):
                 removed.append(label_of(root, path))
     if not gone:
         return die("dropped nothing for %s" % args.rule,
-                   "Run 'baseline.py group' for the rules that are actually recorded.")
+                   "Run './prism baseline group' for the rules that are actually recorded.")
     for label, dropped in touched:
         print("  %-34s %d dropped" % (label, dropped))
     print("Dropped %d findings for %s across %d module(s); %d remain. Run "

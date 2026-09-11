@@ -51,8 +51,13 @@ rm -rf "$status_repo/core/domain/build/reports"
 out=$(PRISM_ROOT="$status_repo" sh "$STATUS" 2>&1)
 assert_eq "0" "$?" "status.sh exits 0 with a stale module present"
 assert_contains "$out" "no current result" "a module with no report is counted as such"
-assert_contains "$out" "prismCoverage" "the refresh command for a JVM module is printed"
-assert_contains "$out" ":core:domain:prismCoverage" "and it names the module"
+# 0.6.3: ONE command, because since 0.6.3 there is one. This used to be the
+# init-script Gradle invocation plus a coverage.py record line with four
+# arguments -- all of which ./prism coverage derives from the module name.
+assert_contains "$out" "./prism coverage" "the refresh command is printed"
+assert_contains "$out" "./prism coverage :core:domain" "and it names the module"
+assert_not_contains "$out" "coverage.py record" \
+    "and does NOT hand back a library path for a person to retype"
 
 gate_render=$(cd "$status_repo" && PRISM_ROOT="$status_repo" sh -c \
     '. "$0/lib/affected.sh"; prism_refresh_commands ":core:domain" jvm' \
@@ -66,8 +71,12 @@ mkdir -p "$status_repo/core/other/src/androidTest/java"
 printf 'class OtherAndroidTest\n' \
     > "$status_repo/core/other/src/androidTest/java/OtherAndroidTest.kt"
 out=$(PRISM_ROOT="$status_repo" sh "$STATUS" 2>&1)
-assert_contains "$out" "device_lock.py" \
-    "an on-device refresh goes through the device lock"
+# 0.6.3: the refresh block hands back ./prism coverage, and THAT routes the
+# connected run through the device lock -- see test_prism.sh. What status must
+# still do is say the module needs a device and how to get one, because the
+# verb cannot boot an emulator.
+assert_contains "$out" "./prism coverage" \
+    "an on-device refresh is a verb a person can retype"
 assert_contains "$out" "select_emulator.py" "and says how to get an emulator"
 
 # Every remediation command names the framework's own asset directory. The
@@ -77,8 +86,6 @@ assert_contains "$out" "select_emulator.py" "and says how to get an emulator"
 # at a file they do not have. Per design D9 the location is the framework's.
 assert_contains "$out" ".prism/assets/select_emulator.py" \
     "the emulator hint names the framework's asset directory"
-assert_contains "$out" ".prism/assets/device_lock.py" \
-    "and so does the device lock"
 assert_eq "0" "$(printf '%s' "$out" | grep -c 'skills/')" \
     "no refresh command names a harness skill directory"
 
@@ -169,7 +176,7 @@ assert_not_contains "$out" "would DENY" \
 # The number must not be laundered into the stale bucket, or the refresh hint
 # tells people to re-run a task that already produced the number on screen.
 assert_contains "$out" "2 observed" "observed modules are counted separately"
-assert_not_contains "$out" ":core:domain:prismCoverage" \
+assert_not_contains "$out" "./prism coverage :core:domain" \
     "and a module with a current report is not sent to refresh it"
 
 rm -f "$status_repo/.prism/scope.json"

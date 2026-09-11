@@ -125,7 +125,7 @@ report_suppressed() {
             printf '           %s baselined file name(s) are no longer in their module, so\n' "$stale"
             printf '           those findings block again — an id names a FILE, so renaming\n'
             printf '           one detaches its entries. Which ones:\n'
-            printf '             python3 .prism/verify/lib/baseline.py count\n'
+            printf '             ./prism baseline count\n'
         }
     fi
     # PRISM'S OWN TWO MODULES ARE NOT ON THIS SCREEN, and the other two tables
@@ -142,8 +142,12 @@ report_suppressed() {
     # file's own header records a definition kept in two places drifting apart
     # twice in one branch, and tests/test_affected.sh exists to hold the two it
     # already has together.
-    kt_own=$( PRISM_ROOT="$PRISM_HOME" . "$LIB/affected.sh" >/dev/null 2>&1
-              prism_own_modules | sed 's|^:||; s|:|/|g' )
+    kt_own=$(
+        PRISM_ROOT="$PRISM_HOME"
+        export PRISM_ROOT
+        . "$LIB/affected.sh" >/dev/null 2>&1
+        prism_own_modules | sed 's|^:||; s|:|/|g'
+    )
     kt_files=$(find "$PRISM_HOME" -name ktlint.baseline.xml -not -path '*/build/*' 2>/dev/null \
         | while read -r f; do
               rel=$(dirname "${f#"$PRISM_HOME"/}")
@@ -341,70 +345,171 @@ cmd_baseline() {
 #
 # It cannot launder a number. coverage.py record refuses unless the timestamps
 # already say the report matches the source on disk.
+# STAMP THE REPORT WITH THE CONTENT IT MEASURED, in the same breath as
+# producing it, because whoever just ran it is the only one in a position to
+# know the two agree. It refuses unless the timestamps already say so, so this
+# cannot launder a stale number -- which is what makes the differential canary
+# survivable: reverting it rewrites the file, and the fingerprint says the bytes
+# came back the same.
+cmd_coverage_record() {
+    cr_xml=$(
+        PRISM_ROOT="$PRISM_HOME"
+        export PRISM_ROOT
+        . "$LIB/affected.sh" >/dev/null 2>&1
+        prism_coverage_xml_for "$1" "$2"
+    )
+    cr_result=$(python3 "$LIB/coverage.py" record --module "$1" \
+        --root "$PRISM_HOME" --kind "$2" --xml "$cr_xml" 2>&1)
+    if [ "$cr_result" != "recorded" ]; then
+        printf '  %-30s %s\n' "" "$cr_result"
+        return 0
+    fi
+    # The verdict, not just the fact that a file was written: the percentage, the
+    # floor it is judged against, and whether that combination would deny.
+    cr_verdict=$(python3 "$LIB/coverage.py" verdict --module "$1" \
+        --root "$PRISM_HOME" --kind "$2" --xml "$cr_xml" \
+        --config "$PRISM_HOME/.prism/verify/thresholds.json" 2>/dev/null)
+    # `pass`, `low` and `observe` all print "<word> <percent> <floor>", so the
+    # number is in the same place for all three. The observing case is the one
+    # that matters most here: it is what EVERY fresh install is in, and printing
+    # only "recorded" there was the whole of the complaint -- a command whose job
+    # is to produce a number, ending without one.
+    cr_pct=$(printf '%s' "$cr_verdict" | cut -d" " -f2)
+    cr_floor=$(printf '%s' "$cr_verdict" | cut -d" " -f3)
+    case "$cr_verdict" in
+        pass\ *)
+            printf '  %-30s %s%% of lines covered, floor %s — clears it\n' \
+                "" "$cr_pct" "$cr_floor" ;;
+        low\ *)
+            printf '  %-30s %s%% of lines covered, floor %s — BELOW it\n' \
+                "" "$cr_pct" "$cr_floor" ;;
+        "observe no-report"*|"observe no-line-data"*)
+            printf '  %-30s recorded, but the report has no line data\n' "" ;;
+        observe\ *)
+            printf '  %-30s %s%% of lines covered, floor %s — reported, not blocking\n' \
+                "" "$cr_pct" "$cr_floor" ;;
+        *)
+            printf '  %-30s recorded\n' "" ;;
+    esac
+}
+
 cmd_coverage() {
     modules=$*
     [ -n "$modules" ] || modules=$(
-        PRISM_ROOT="$PRISM_HOME" . "$LIB/affected.sh" >/dev/null 2>&1
-        prism_all_modules 2>/dev/null
+        PRISM_ROOT="$PRISM_HOME"
+        export PRISM_ROOT
+        . "$LIB/affected.sh" >/dev/null 2>&1
+        prism_all_modules
     )
-    [ -n "$modules" ] || die "no modules found" \
-        "Is this the repository root, and does settings.gradle.kts list modules?"
+    [ -n "$modules" ] || die "could not work out which modules this repository has" \
+        "Any error above this line is the reason. If there is none, check that" \
+        "settings.gradle.kts lists modules and that you are at the repository root."
+
+    printf 'Measuring coverage, and recording each report against the source it\n'
+    printf 'measured. A number here is what the push gate reads.\n\n'
 
     needs_device=""
     for module in $modules; do
-        kind=$(python3 "$LIB/coverage.py" check --module "$module" --root "$PRISM_HOME" 2>/dev/null)
+        kind=$(python3 "$LIB/coverage.py" check --module "$module" --root "$PRISM_HOME")
         case "$kind" in
             jvm) ;;
             combined|instrumentation)
+                # Collected, not announced. Pass two says what happens to it.
                 needs_device="$needs_device $module"
-                printf '  %-34s %-12s needs a connected run\n' "$module" "$kind"
+                continue
+                ;;
+            no-jacoco)
+                printf '  %-30s %-11s no coverage plugin, so nothing to measure\n' \
+                    "$module" "$kind"
                 continue
                 ;;
             *)
-                printf '  %-34s %-12s nothing to measure\n' "$module" "${kind:-unknown}"
+                printf '  %-30s %-11s no test sources, so nothing to measure\n' \
+                    "$module" "${kind:-unknown}"
                 continue
                 ;;
         esac
 
-        printf '  %-34s %-12s measuring…\n' "$module" "$kind"
+        printf '  %-30s %-11s unit tests\n' "$module" "$kind"
         ( cd "$PRISM_HOME" && ./gradlew \
             --init-script "$PRISM_HOME/.prism/assets/prism-coverage.init.gradle.kts" \
             "$module:prismCoverage" ) || {
                 printf '  %-34s FAILED — the tests did not pass\n' "$module"
                 continue
             }
-        xml=$(
-            PRISM_ROOT="$PRISM_HOME" . "$LIB/affected.sh" >/dev/null 2>&1
-            prism_coverage_xml_for "$module" "$kind"
-        )
-        result=$(python3 "$LIB/coverage.py" record --module "$module" \
-            --root "$PRISM_HOME" --kind "$kind" --xml "$xml" 2>&1)
-        printf '  %-34s %s\n' "$module" "$result"
+        cmd_coverage_record "$module" "$kind"
     done
+
+    # THE CONNECTED HALF, and it goes through the lock or not at all. Two
+    # connected runs of the same test package on one emulator kill each other:
+    # measured on :feature:files:presentation, where one run died with
+    # "Instrumentation run failed due to Process crashed" while the competing
+    # run finished green with 68 tests. The only casualty was the .ec file the
+    # killed run could not pull back, after which coverage read `no-device-run`
+    # -- which looks exactly like "you never ran it".
+    measured=""
+    if [ -n "$needs_device" ] && [ -z "${ANDROID_SERIAL:-}" ]; then
+        found=$(python3 "$PRISM_HOME/.prism/assets/select_emulator.py" --min-sdk 26 2>/dev/null)
+        case "$found" in running\ *) ANDROID_SERIAL="${found#running }"; export ANDROID_SERIAL ;; esac
+    fi
+    for module in $needs_device; do
+        [ -n "${ANDROID_SERIAL:-}" ] || continue
+        kind=$(python3 "$LIB/coverage.py" check --module "$module" --root "$PRISM_HOME" 2>/dev/null)
+        printf '  %-30s %-11s unit + instrumented, on %s\n' \
+            "$module" "$kind" "$ANDROID_SERIAL"
+        ( cd "$PRISM_HOME" && python3 "$PRISM_HOME/.prism/assets/device_lock.py" \
+            -- ./gradlew "$module:connectedDebugAndroidTest" ) || {
+                printf '  %-34s FAILED — the connected suite did not pass\n' "$module"
+                continue
+            }
+        ( cd "$PRISM_HOME" && ./gradlew \
+            --init-script "$PRISM_HOME/.prism/assets/prism-combined-coverage.init.gradle.kts" \
+            "$module:prismCombinedCoverage" ) || {
+                printf '  %-34s FAILED — the coverage report did not build\n' "$module"
+                continue
+            }
+        cmd_coverage_record "$module" "$kind"
+        measured="$measured $module"
+    done
+
+    # Rebuild rather than edit the string: `sed s|:app||` leaves the separator
+    # behind, so an emptied list still tested non-empty and the closing block
+    # announced that no modules needed a device.
+    remaining=""
+    for module in $needs_device; do
+        case " $measured " in *" $module "*) ;; *) remaining="$remaining $module" ;; esac
+    done
+    needs_device=$remaining
 
     # PRISM DOES NOT BOOT EMULATORS. Starting a virtual machine on somebody's
     # computer is not something a verification command should decide to do, and
     # a wrong AVD is slow to notice. It uses one that is already running and
     # otherwise says what to type.
     if [ -n "$needs_device" ]; then
-        printf '\nThese modules have an instrumented suite, so they need a device:\n'
-        printf '   %s\n' "$needs_device"
+        for module in $needs_device; do
+            printf '  %-30s %-11s not measured — it has instrumented tests\n' \
+                "$module" "combined"
+        done
         serial=$(python3 "$PRISM_HOME/.prism/assets/select_emulator.py" --min-sdk 26 2>/dev/null)
         case "$serial" in
-            running\ *)
-                printf '\nAn emulator is running (%s). Re-run with it:\n' "${serial#running }"
-                printf '   ANDROID_SERIAL=%s ./prism coverage%s\n' \
-                    "${serial#running }" "$needs_device"
-                ;;
             boot\ *)
-                printf '\nNo emulator is running. Start one, then run this again:\n'
-                printf '   android emulator start %s\n' "${serial#boot }"
+                printf '\nThose need a running device. Start one, then run this again:\n\n'
+                printf '    android emulator start %s\n' "${serial#boot }"
                 ;;
             *)
-                printf '\nNo compatible emulator was found (minSdk 26).\n'
-                printf '`./prism status` prints the full commands for these modules.\n'
+                printf '\nThose need a running device, and none was found for minSdk 26.\n'
+                printf 'Create one in Android Studio, or list what you have with:\n\n'
+                printf '    android emulator list\n'
                 ;;
         esac
+        # THE OTHER WAY OUT, and on a new project it is often the right one. A
+        # module is `combined` purely because src/androidTest/ exists -- an empty
+        # directory counts. A generated project ships one whether or not anybody
+        # intends to write instrumented tests, and that alone is what makes its
+        # coverage need an emulator.
+        printf '\nOr, if you are not going to write instrumented tests, delete the\n'
+        printf 'androidTest source set. The module becomes unit-test-only and\n'
+        printf 'measures with no device at all.\n'
     fi
 }
 

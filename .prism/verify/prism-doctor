@@ -1319,7 +1319,7 @@ print(json.load(open(sys.argv[1])).get('baseBranch',''))" "$cfg" 2>/dev/null)
             report_fail "a detekt baseline does not parse" \
                 "detekt fails EVERY module's analysis on an invalid baseline, so this" \
                 "is a broken build rather than an empty baseline. Which file it is:" \
-                "  python3 .prism/verify/lib/baseline.py count"
+                "  ./prism baseline count"
         elif [ "$suppressed" = "0" ]; then
             if [ "$(prism_posture)" = "observe" ]; then
                 report_pass "nothing suppressed — nothing left to burn down" \
@@ -1331,7 +1331,7 @@ print(json.load(open(sys.argv[1])).get('baseBranch',''))" "$cfg" 2>/dev/null)
             report_pass "detekt baselines: $suppressed findings suppressed" \
                 "These were present at install and do not block; a NEW violation" \
                 "of the same rule still does. See them by rule, worst first:" \
-                "  python3 .prism/verify/lib/baseline.py group"
+                "  ./prism baseline group"
         fi
         # A baseline id carries the BARE FILENAME, so renaming a file detaches
         # its entries and those findings block again. Reported rather than
@@ -1342,7 +1342,7 @@ print(json.load(open(sys.argv[1])).get('baseBranch',''))" "$cfg" 2>/dev/null)
             report_pass "$stale baselined file name(s) are no longer in their module" \
                 "Those entries match nothing now, so the findings they used to" \
                 "suppress are live. Which ones:" \
-                "  python3 .prism/verify/lib/baseline.py count"
+                "  ./prism baseline count"
         fi
     fi
 

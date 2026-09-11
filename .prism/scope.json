@@ -20,7 +20,8 @@
     "Written by verify/lib/scope.py. `./prism status` reports what it resolves."
   ],
   "default": {
-    "coverage": "observe"
+    "coverage": "observe",
+    "konsist": "enforce"
   },
   "modules": {}
 }

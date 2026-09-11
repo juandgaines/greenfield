@@ -381,18 +381,18 @@ prism_coverage_xml_for() {
 prism_refresh_commands() {
     prism_refresh_module="$1"
     prism_refresh_kind="$2"
+    # ONE COMMAND, because since 0.6.3 there is one. This used to print the
+    # init-script Gradle invocation, the device_lock.py wrapper and a
+    # coverage.py record line with four arguments -- every one of which
+    # ./prism coverage now derives from the module name, out of this very
+    # function. A gate that denies a push should hand back something a person
+    # can retype, not a library path.
     case "$prism_refresh_kind" in
         jvm)
-            printf './gradlew --init-script %s \\\n  %s:prismCoverage\n' \
-                "$PRISM_ASSETS_DIR/prism-coverage.init.gradle.kts" \
-                "$prism_refresh_module"
+            printf './prism coverage %s\n' "$prism_refresh_module"
             ;;
         *)
-            printf 'ANDROID_SERIAL=<serial> python3 \\\n  %s \\\n  -- ./gradlew %s:connectedDebugAndroidTest\n' \
-                "$PRISM_ASSETS_DIR/device_lock.py" \
-                "$prism_refresh_module"
-            printf './gradlew --init-script %s \\\n  %s:prismCombinedCoverage\n' \
-                "$PRISM_ASSETS_DIR/prism-combined-coverage.init.gradle.kts" \
+            printf './prism coverage %s      # needs a booted emulator\n' \
                 "$prism_refresh_module"
             ;;
     esac
@@ -407,9 +407,6 @@ prism_refresh_commands() {
     # `stale`. The differential canary does exactly that: reverting it rewrites
     # the file, so proving the gate was live cost the number, which on a
     # connected suite is minutes and an emulator.
-    printf 'python3 %s/coverage.py record \\\n  --module %s --root %s --kind %s --xml %s\n' \
-        "$PRISM_LIB_DIR" "$prism_refresh_module" "$PRISM_ROOT" \
-        "$prism_refresh_kind" "$(prism_coverage_xml_for "$prism_refresh_module" "$prism_refresh_kind")"
 }
 
 # Exit 0 when a module's kind needs a booted device to refresh.
